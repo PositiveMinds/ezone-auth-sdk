@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: ezone-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /v1/health
+    envVars:
+      - key: EZONE_DATABASE_URL
+        sync: false
+      - key: EZONE_DB_POOL_SIZE
+        value: "4"
+      - key: EZONE_PORT
+        value: "8080"
+      - key: EZONE_THREADS
+        value: "4"
+      - key: EZONE_EMAIL_PROVIDER
+        value: resend
+      - key: EZONE_RESEND_API_KEY
+        sync: false
+      - key: EZONE_EMAIL_FROM
+        value: "ezone <positiveminds256@gmail.com>"
+      - key: EZONE_RATE_LIMIT
+        value: "60"
+      - key: EZONE_APP_URL
+        sync: false
+      - key: EZONE_CORS_ORIGIN
+        sync: false
