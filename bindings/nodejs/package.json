@@ -1,0 +1,26 @@
+{
+  "name": "ezone-sdk",
+  "version": "0.1.0",
+  "description": "Passwordless authentication SDK — Node.js/TypeScript client",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types":  "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev":   "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["passwordless", "authentication", "webauthn", "passkeys", "ezone"],
+  "license": "MIT"
+}

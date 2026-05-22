@@ -1,0 +1,24 @@
+{
+  "name": "@ezone/browser",
+  "version": "0.1.0",
+  "description": "ezone passwordless SDK — browser client (WebCrypto + WebAuthn)",
+  "type": "module",
+  "main":  "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types":  "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev":   "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "keywords": ["passwordless", "webauthn", "passkeys", "webcrypto", "ezone"],
+  "license": "MIT",
+  "sideEffects": false
+}

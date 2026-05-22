@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── C++ core: build + test ───────────────────────────────────────────────────
+  cpp:
+    name: C++ (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake ninja-build
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3 cmake ninja
+
+      - name: Configure (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEZONE_BUILD_SERVER=OFF
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DEZONE_BUILD_SERVER=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -C Release
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: build/Testing/
+
+  # ── Node.js SDK ──────────────────────────────────────────────────────────────
+  nodejs:
+    name: Node.js SDK
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: bindings/nodejs/package.json
+
+      - name: Install
+        working-directory: bindings/nodejs
+        run: npm ci
+
+      - name: Build
+        working-directory: bindings/nodejs
+        run: npm run build
+
+      - name: Type check
+        working-directory: bindings/nodejs
+        run: npx tsc --noEmit
+
+  # ── Browser SDK ──────────────────────────────────────────────────────────────
+  browser:
+    name: Browser SDK
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: bindings/browser/package.json
+
+      - name: Install
+        working-directory: bindings/browser
+        run: npm ci
+
+      - name: Build
+        working-directory: bindings/browser
+        run: npm run build
+
+  # ── Python SDK ───────────────────────────────────────────────────────────────
+  python:
+    name: Python SDK (${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python: ['3.9', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Import check
+        working-directory: bindings/python
+        run: python -c "from ezone import EzoneClient, EzoneError; print('OK')"
+
+      - name: Build wheel
+        working-directory: bindings/python
+        run: pip install build && python -m build --wheel
+
+  # ── Go SDK ───────────────────────────────────────────────────────────────────
+  go:
+    name: Go SDK (${{ matrix.go }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        go: ['1.22', '1.23']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: bindings/go/go.sum
+
+      - name: Test
+        working-directory: bindings/go
+        run: go test ./... -v -race
+
+      - name: Vet
+        working-directory: bindings/go
+        run: go vet ./...
+
+  # ── Docs build ───────────────────────────────────────────────────────────────
+  docs:
+    name: Docs
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: docs/package.json
+
+      - name: Install
+        working-directory: docs
+        run: npm ci
+
+      - name: Build
+        working-directory: docs
+        run: npm run build

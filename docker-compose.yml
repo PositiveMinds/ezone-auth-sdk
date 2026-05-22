@@ -1,0 +1,70 @@
+version: "3.9"
+
+# ── ezone self-hosted stack ───────────────────────────────────────────────────
+#
+# Quick start:
+#   cp .env.example .env      # edit your secrets
+#   docker compose up -d
+#
+# The ezone REST API will be available on http://localhost:8080
+# PostgreSQL data is persisted in the "pgdata" Docker volume.
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-ezone}
+      POSTGRES_USER:     ${POSTGRES_USER:-ezone}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ezone}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Not exposed publicly — only accessible within the compose network
+    expose:
+      - "5432"
+
+  # ── ezone REST server ────────────────────────────────────────────────────────
+  ezone:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${EZONE_PORT:-8080}:8080"
+    environment:
+      # Storage
+      EZONE_DATABASE_URL: "postgresql://${POSTGRES_USER:-ezone}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ezone}?sslmode=disable"
+      EZONE_DB_POOL_SIZE: "${EZONE_DB_POOL_SIZE:-8}"
+
+      # Server
+      EZONE_HOST:       "0.0.0.0"
+      EZONE_PORT:       "8080"
+      EZONE_THREADS:    "${EZONE_THREADS:-4}"
+      EZONE_APP_URL:    "${EZONE_APP_URL:-http://localhost:3000}"
+      EZONE_CORS_ORIGIN: "${EZONE_CORS_ORIGIN:-}"
+      EZONE_RATE_LIMIT: "${EZONE_RATE_LIMIT:-60}"
+
+      # Email  (set EZONE_EMAIL_PROVIDER=resend + API key for production)
+      EZONE_EMAIL_PROVIDER:   "${EZONE_EMAIL_PROVIDER:-log}"
+      EZONE_RESEND_API_KEY:   "${EZONE_RESEND_API_KEY:-}"
+      EZONE_EMAIL_FROM:       "${EZONE_EMAIL_FROM:-}"
+
+      # TLS  (optional — put certs in ./certs/ and set paths)
+      EZONE_TLS_CERT: "${EZONE_TLS_CERT:-}"
+      EZONE_TLS_KEY:  "${EZONE_TLS_KEY:-}"
+    volumes:
+      # Mount TLS certs if configured
+      - ${EZONE_CERT_DIR:-/dev/null}:/certs:ro
+
+volumes:
+  pgdata:

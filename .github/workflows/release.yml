@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ── Build native binaries for all platforms ──────────────────────────────────
+  build-native:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: ezone-linux-x64
+            lib_ext: .so
+          - os: macos-14
+            artifact: ezone-macos-arm64
+            lib_ext: .dylib
+          - os: windows-2022
+            artifact: ezone-windows-x64
+            lib_ext: .dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake ninja-build
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3 cmake ninja
+
+      - name: Configure + Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEZONE_BUILD_SERVER=ON \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build --config Release
+
+      - name: Configure + Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DEZONE_BUILD_SERVER=ON `
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build --config Release
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/ezone-server* dist/ 2>/dev/null || true
+          cp build/libezone-sdk* dist/ 2>/dev/null || true
+          cp build/ezone-sdk* dist/ 2>/dev/null || true
+          cp include/ezone/ezone_c.h dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  # ── Publish Node.js SDK to npm ───────────────────────────────────────────────
+  publish-npm:
+    name: Publish npm
+    runs-on: ubuntu-22.04
+    needs: build-native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build Node.js SDK
+        working-directory: bindings/nodejs
+        run: npm ci && npm run build
+
+      - name: Set version from tag
+        working-directory: bindings/nodejs
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          npm version $VERSION --no-git-tag-version
+
+      - name: Publish
+        working-directory: bindings/nodejs
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Publish Browser SDK to npm ───────────────────────────────────────────────
+  publish-npm-browser:
+    name: Publish @ezone/browser
+    runs-on: ubuntu-22.04
+    needs: build-native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build
+        working-directory: bindings/browser
+        run: npm ci && npm run build
+
+      - name: Set version
+        working-directory: bindings/browser
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          npm version $VERSION --no-git-tag-version
+
+      - name: Publish
+        working-directory: bindings/browser
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Publish Python SDK to PyPI ───────────────────────────────────────────────
+  publish-pypi:
+    name: Publish PyPI
+    runs-on: ubuntu-22.04
+    needs: build-native
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ezone-sdk/
+    permissions:
+      id-token: write   # OIDC trusted publishing — no token needed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/version = \"0.1.0\"/version = \"$VERSION\"/" \
+            bindings/python/pyproject.toml
+
+      - name: Build wheel + sdist
+        working-directory: bindings/python
+        run: pip install build && python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: bindings/python/dist/
+
+  # ── Publish Go module (tag push triggers pkg.go.dev indexing) ────────────────
+  publish-go:
+    name: Tag Go module
+    runs-on: ubuntu-22.04
+    needs: build-native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Verify module
+        working-directory: bindings/go
+        run: go build ./... && go vet ./...
+      # pkg.go.dev indexes new versions automatically when a tag is pushed
+
+  # ── Create GitHub Release with all binaries ──────────────────────────────────
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [build-native, publish-npm, publish-pypi]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Zip artifacts
+        run: |
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            zip -r "artifacts/${name}.zip" "$dir"
+          done
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          git log $(git describe --tags --abbrev=0 HEAD^)..HEAD \
+            --pretty=format:"- %s" >> $GITHUB_OUTPUT || true
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ezone SDK ${{ github.ref_name }}
+          body: |
+            ## What's changed
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            ## Packages
+            | Platform | Install |
+            |---|---|
+            | Node.js | `npm install ezone-sdk` |
+            | Browser | `npm install @ezone/browser` |
+            | Python  | `pip install ezone-sdk` |
+            | Go      | `go get github.com/ezone-sdk/ezone-go` |
+
+            ## Native binaries
+            Download the pre-built server binary and shared library for your platform below.
+          files: artifacts/*.zip
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

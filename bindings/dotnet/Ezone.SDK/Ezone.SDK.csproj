@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>Ezone.SDK</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>ezone contributors</Authors>
+    <Description>ezone passwordless authentication SDK for .NET</Description>
+    <PackageTags>authentication;passwordless;ecdsa;security</PackageTags>
+    <RepositoryUrl>https://github.com/ezone-sdk/ezone-sdk</RepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.*" />
+  </ItemGroup>
+
+</Project>

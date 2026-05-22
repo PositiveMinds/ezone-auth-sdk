@@ -1,0 +1,12 @@
+.git
+.env
+*.env
+build/
+bindings/
+docs/
+examples/
+tests/
+*.md
+.dockerignore
+docker-compose.yml
+.env.example
