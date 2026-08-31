@@ -15,6 +15,17 @@
 #include <cstring>
 #include <sstream>
 
+#ifdef EZONE_LIBSODIUM_ENABLED
+// Included here, before `namespace ezone` opens, so libsodium's C API lands
+// in the global namespace as intended. Including it further down inside the
+// namespace (as this file used to) silently pulled every libsodium symbol
+// into `ezone::`, which is harmless for most of them but broke
+// CryptoEngine::sodium_memcmp/sodium_memzero: those wrapper methods share
+// their name with the libsodium functions they call, so unqualified lookup
+// inside the wrapper found itself instead of libsodium's implementation.
+#include <sodium.h>
+#endif
+
 namespace ezone {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -641,7 +652,8 @@ Result<Challenge> CryptoEngine::deserialize_challenge(
 
 Result<AuthToken> CryptoEngine::issue_token(
     const std::string&  user_id,
-    const SecureBuffer& private_key_der) const
+    const SecureBuffer& private_key_der,
+    const std::string&  device_id) const
 {
     uint64_t now     = unix_now();
     uint64_t expires = now + impl_->cfg.token_ttl_seconds;
@@ -650,6 +662,7 @@ Result<AuthToken> CryptoEngine::issue_token(
     std::string header  = R"({"alg":"ES384","typ":"AT"})";
     std::ostringstream payload_ss;
     payload_ss << R"({"sub":")" << user_id
+               << R"(","did":")" << device_id
                << R"(","iat":)"  << now
                << R"(,"exp":)"   << expires
                << "}";
@@ -668,6 +681,7 @@ Result<AuthToken> CryptoEngine::issue_token(
 
     AuthToken tok;
     tok.user_id    = user_id;
+    tok.device_id  = device_id;
     tok.issued_at  = now;
     tok.expires_at = expires;
     tok.encoded    = signing_input + "." + base64url_encode(sig.value);
@@ -719,6 +733,7 @@ Result<AuthToken> CryptoEngine::verify_token(
 
     AuthToken tok;
     tok.user_id    = extract("sub");
+    tok.device_id  = extract("did");
     tok.issued_at  = static_cast<uint64_t>(std::stoull(extract("iat")));
     tok.expires_at = static_cast<uint64_t>(std::stoull(extract("exp")));
     tok.encoded    = encoded;
@@ -728,6 +743,122 @@ Result<AuthToken> CryptoEngine::verify_token(
 
     return Result<AuthToken>::success(std::move(tok));
 }
+
+
+#ifdef EZONE_LIBSODIUM_ENABLED
+
+Result<AuthToken> CryptoEngine::issue_token_ed25519(
+    const std::string&  user_id,
+    const SecureBuffer& private_key,
+    const std::string&  device_id) const
+{
+    if (private_key.size() != crypto_sign_SECRETKEYBYTES)
+        return Result<AuthToken>::failure("invalid Ed25519 private key size");
+
+    uint64_t now     = unix_now();
+    uint64_t expires = now + impl_->cfg.token_ttl_seconds;
+
+    // Header specifies Ed25519
+    std::string header  = R"({"alg":"Ed25519","typ":"AT"})";
+    std::ostringstream payload_ss;
+    payload_ss << R"({"sub":")" << user_id
+               << R"(","did":")" << device_id
+               << R"(","iat":)"  << now
+               << R"(,"exp":)"   << expires
+               << "}";
+    std::string payload = payload_ss.str();
+
+    std::string h_enc = base64url_encode(
+        std::vector<uint8_t>(header.begin(), header.end()));
+    std::string p_enc = base64url_encode(
+        std::vector<uint8_t>(payload.begin(), payload.end()));
+
+    std::string signing_input = h_enc + "." + p_enc;
+    std::vector<uint8_t> si_bytes(signing_input.begin(), signing_input.end());
+
+    // Ed25519 sign
+    std::vector<uint8_t> sig(crypto_sign_BYTES);
+    unsigned long long sig_len = 0;
+    if (crypto_sign_detached(sig.data(), &sig_len,
+            si_bytes.data(), si_bytes.size(),
+            private_key.data()) != 0)
+        return Result<AuthToken>::failure("Ed25519 signing failed");
+
+    AuthToken tok;
+    tok.user_id    = user_id;
+    tok.device_id  = device_id;
+    tok.issued_at  = now;
+    tok.expires_at = expires;
+    tok.encoded    = signing_input + "." + base64url_encode(sig);
+
+    return Result<AuthToken>::success(std::move(tok));
+}
+
+
+Result<AuthToken> CryptoEngine::verify_token_ed25519(
+    const std::string&          encoded,
+    const std::vector<uint8_t>& public_key) const
+{
+    if (public_key.size() != crypto_sign_PUBLICKEYBYTES)
+        return Result<AuthToken>::failure("invalid Ed25519 public key size");
+
+    // Split header.payload.signature
+    size_t dot1 = encoded.find('.');
+    size_t dot2 = encoded.find('.', dot1 + 1);
+    if (dot1 == std::string::npos || dot2 == std::string::npos)
+        return Result<AuthToken>::failure("malformed token");
+
+    std::string signing_input = encoded.substr(0, dot2);
+    std::string sig_enc       = encoded.substr(dot2 + 1);
+
+    auto sig = base64url_decode(sig_enc);
+    if (!sig) return Result<AuthToken>::failure("bad signature encoding");
+    if (sig.value.size() != crypto_sign_BYTES)
+        return Result<AuthToken>::failure("invalid Ed25519 signature size");
+
+    std::vector<uint8_t> si_bytes(signing_input.begin(), signing_input.end());
+
+    // Ed25519 verify
+    if (crypto_sign_verify_detached(
+            sig.value.data(),
+            si_bytes.data(), si_bytes.size(),
+            public_key.data()) != 0)
+        return Result<AuthToken>::failure("token signature invalid");
+
+    // Decode payload
+    auto payload_bytes = base64url_decode(
+        encoded.substr(dot1 + 1, dot2 - dot1 - 1));
+    if (!payload_bytes)
+        return Result<AuthToken>::failure("bad payload encoding");
+
+    std::string payload(payload_bytes.value.begin(), payload_bytes.value.end());
+
+    auto extract = [&](const std::string& key) -> std::string {
+        std::string search = "\"" + key + "\":";
+        size_t pos = payload.find(search);
+        if (pos == std::string::npos) return {};
+        pos += search.size();
+        bool is_str = payload[pos] == '"';
+        if (is_str) ++pos;
+        size_t end = payload.find(is_str ? '"' : ',', pos);
+        if (end == std::string::npos) end = payload.rfind('}');
+        return payload.substr(pos, end - pos);
+    };
+
+    AuthToken tok;
+    tok.user_id    = extract("sub");
+    tok.device_id  = extract("did");
+    tok.issued_at  = static_cast<uint64_t>(std::stoull(extract("iat")));
+    tok.expires_at = static_cast<uint64_t>(std::stoull(extract("exp")));
+    tok.encoded    = encoded;
+
+    if (unix_now() > tok.expires_at)
+        return Result<AuthToken>::failure("token expired");
+
+    return Result<AuthToken>::success(std::move(tok));
+}
+
+#endif // EZONE_LIBSODIUM_ENABLED
 
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -775,14 +906,14 @@ std::string CryptoEngine::base64url_encode(const std::vector<uint8_t>& data) {
 Result<std::vector<uint8_t>> CryptoEngine::base64url_decode(
     const std::string& encoded)
 {
-    // Build decode table
-    static const int8_t tbl[256] = []() {
-        int8_t t[256];
-        std::memset(t, -1, sizeof(t));
+    // Build decode table (initialised once)
+    static const std::array<int8_t, 256> tbl = []() {
+        std::array<int8_t, 256> t;
+        t.fill(-1);
         for (int i = 0; i < 64; ++i)
             t[static_cast<uint8_t>(B64URL_CHARS[i])] = static_cast<int8_t>(i);
-        return std::array<int8_t,256>(reinterpret_cast<int8_t(&)[256]>(t));
-    }().data();  // initialised once
+        return t;
+    }();
 
     std::vector<uint8_t> out;
     out.reserve((encoded.size() * 3) / 4 + 1);
@@ -804,6 +935,24 @@ Result<std::vector<uint8_t>> CryptoEngine::base64url_decode(
     return Result<std::vector<uint8_t>>::success(std::move(out));
 }
 
+Result<std::string> CryptoEngine::derive_device_id(
+    const std::vector<uint8_t>& public_key_der)
+{
+    CryptoEngine eng; // hash_sha384 is stateless — a scratch instance is fine
+    auto h = eng.hash_sha384(public_key_der);
+    if (!h || h.value.size() < 16)
+        return Result<std::string>::failure("failed to derive device id");
+
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string id;
+    id.reserve(32);
+    for (int i = 0; i < 16; ++i) {
+        id += hex_chars[(h.value[i] >> 4) & 0xF];
+        id += hex_chars[h.value[i] & 0xF];
+    }
+    return Result<std::string>::success(std::move(id));
+}
+
 bool CryptoEngine::is_fips_mode() noexcept {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     return EVP_default_properties_is_fips_enabled(nullptr) == 1;
@@ -811,5 +960,284 @@ bool CryptoEngine::is_fips_mode() noexcept {
     return FIPS_mode() != 0;
 #endif
 }
+
+bool CryptoEngine::has_libsodium() noexcept {
+#ifdef EZONE_LIBSODIUM_ENABLED
+    return true;
+#else
+    return false;
+#endif
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Libsodium methods — only compiled when EZONE_LIBSODIUM_ENABLED is defined
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#ifdef EZONE_LIBSODIUM_ENABLED
+
+// Ensure Libsodium is initialized (called once)
+struct SodiumInit {
+    SodiumInit() { sodium_init(); }
+};
+static SodiumInit g_sodium_init;
+
+
+Result<CryptoEngine::Ed25519KeyPair> CryptoEngine::generate_ed25519_keypair() const {
+    Ed25519KeyPair kp;
+    kp.private_key.resize(crypto_sign_SECRETKEYBYTES); // 64 bytes
+    kp.public_key.resize(crypto_sign_PUBLICKEYBYTES);  // 32 bytes
+
+    if (crypto_sign_keypair(kp.public_key.data(), kp.private_key.data()) != 0)
+        return Result<Ed25519KeyPair>::failure("Ed25519 keypair generation failed");
+
+    return Result<Ed25519KeyPair>::success(std::move(kp));
+}
+
+
+Result<std::vector<uint8_t>> CryptoEngine::sign_ed25519(
+    const std::vector<uint8_t>& message,
+    const SecureBuffer& private_key) const
+{
+    if (private_key.size() != crypto_sign_SECRETKEYBYTES)
+        return Result<std::vector<uint8_t>>::failure("invalid Ed25519 private key size");
+
+    std::vector<uint8_t> signed_msg(message.size() + crypto_sign_BYTES);
+    unsigned long long signed_msg_len = 0;
+
+    if (crypto_sign_detached(
+            signed_msg.data(), &signed_msg_len,
+            message.data(), message.size(),
+            private_key.data()) != 0)
+        return Result<std::vector<uint8_t>>::failure("Ed25519 signing failed");
+
+    signed_msg.resize(signed_msg_len);
+    return Result<std::vector<uint8_t>>::success(std::move(signed_msg));
+}
+
+
+Result<bool> CryptoEngine::verify_ed25519(
+    const std::vector<uint8_t>& message,
+    const std::vector<uint8_t>& signature,
+    const std::vector<uint8_t>& public_key) const
+{
+    if (signature.size() != crypto_sign_BYTES)
+        return Result<bool>::failure("invalid Ed25519 signature size");
+    if (public_key.size() != crypto_sign_PUBLICKEYBYTES)
+        return Result<bool>::failure("invalid Ed25519 public key size");
+
+    if (crypto_sign_verify_detached(
+            signature.data(),
+            message.data(), message.size(),
+            public_key.data()) != 0)
+        return Result<bool>::success(false);
+
+    return Result<bool>::success(true);
+}
+
+
+Result<CryptoEngine::X25519KeyPair> CryptoEngine::generate_x25519_keypair() const {
+    X25519KeyPair kp;
+    kp.private_key.resize(crypto_kx_SECRETKEYBYTES); // 32 bytes
+    kp.public_key.resize(crypto_kx_PUBLICKEYBYTES);  // 32 bytes
+
+    if (crypto_kx_keypair(kp.public_key.data(), kp.private_key.data()) != 0)
+        return Result<X25519KeyPair>::failure("X25519 keypair generation failed");
+
+    return Result<X25519KeyPair>::success(std::move(kp));
+}
+
+
+Result<std::vector<uint8_t>> CryptoEngine::x25519_exchange(
+    const SecureBuffer& private_key,
+    const std::vector<uint8_t>& peer_public_key) const
+{
+    // Plain X25519 Diffie-Hellman (crypto_scalarmult) — not
+    // crypto_kx_client_session_keys, which is a higher-level client/server
+    // handshake primitive requiring both parties' public keys and asymmetric
+    // client/server key derivation; this method's contract is the simpler
+    // "my private key + their public key -> shared secret".
+    if (private_key.size() != crypto_scalarmult_SCALARBYTES)
+        return Result<std::vector<uint8_t>>::failure("invalid X25519 private key size");
+    if (peer_public_key.size() != crypto_scalarmult_BYTES)
+        return Result<std::vector<uint8_t>>::failure("invalid X25519 public key size");
+
+    std::vector<uint8_t> shared_key(crypto_scalarmult_BYTES); // 32 bytes
+
+    if (crypto_scalarmult(
+            shared_key.data(),
+            private_key.data(),
+            peer_public_key.data()) != 0)
+        return Result<std::vector<uint8_t>>::failure("X25519 key exchange failed");
+
+    return Result<std::vector<uint8_t>>::success(std::move(shared_key));
+}
+
+
+Result<std::vector<uint8_t>> CryptoEngine::encrypt_chacha20poly1305(
+    const std::vector<uint8_t>& plaintext,
+    const SecureBuffer& key,
+    const std::vector<uint8_t>& aad) const
+{
+    if (key.size() != crypto_aead_chacha20poly1305_ietf_KEYBYTES)
+        return Result<std::vector<uint8_t>>::failure("invalid ChaCha20 key size");
+
+    // Random nonce (12 bytes)
+    std::vector<uint8_t> nonce(crypto_aead_chacha20poly1305_ietf_NPUBBYTES);
+    randombytes_buf(nonce.data(), nonce.size());
+
+    std::vector<uint8_t> ciphertext(plaintext.size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
+    unsigned long long ciphertext_len = 0;
+
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            ciphertext.data(), &ciphertext_len,
+            plaintext.data(), plaintext.size(),
+            aad.empty() ? nullptr : aad.data(),
+            aad.size(),
+            nullptr,  // nsec (unused)
+            nonce.data(),
+            key.data()) != 0)
+        return Result<std::vector<uint8_t>>::failure("ChaCha20 encryption failed");
+
+    // Output: nonce(12) || ciphertext || tag(16)
+    std::vector<uint8_t> result;
+    result.reserve(nonce.size() + ciphertext_len);
+    result.insert(result.end(), nonce.begin(), nonce.end());
+    result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + ciphertext_len);
+
+    return Result<std::vector<uint8_t>>::success(std::move(result));
+}
+
+
+Result<SecureBuffer> CryptoEngine::decrypt_chacha20poly1305(
+    const std::vector<uint8_t>& ciphertext_bundle,
+    const SecureBuffer& key,
+    const std::vector<uint8_t>& aad) const
+{
+    if (key.size() != crypto_aead_chacha20poly1305_ietf_KEYBYTES)
+        return Result<SecureBuffer>::failure("invalid ChaCha20 key size");
+
+    size_t nonce_len = crypto_aead_chacha20poly1305_ietf_NPUBBYTES; // 12
+    size_t tag_len = crypto_aead_chacha20poly1305_ietf_ABYTES;       // 16
+
+    if (ciphertext_bundle.size() < nonce_len + tag_len)
+        return Result<SecureBuffer>::failure("ChaCha20 ciphertext too short");
+
+    const uint8_t* nonce = ciphertext_bundle.data();
+    const uint8_t* ciphertext = ciphertext_bundle.data() + nonce_len;
+    size_t ciphertext_len = ciphertext_bundle.size() - nonce_len;
+
+    std::vector<uint8_t> plaintext(ciphertext_len);
+    unsigned long long plaintext_len = 0;
+
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            plaintext.data(), &plaintext_len,
+            nullptr,  // nsec (unused)
+            ciphertext, ciphertext_len,
+            aad.empty() ? nullptr : aad.data(),
+            aad.size(),
+            nonce,
+            key.data()) != 0)
+        return Result<SecureBuffer>::failure("ChaCha20 decryption failed — authentication error");
+
+    SecureBuffer result(plaintext_len);
+    std::memcpy(result.data(), plaintext.data(), plaintext_len);
+    return Result<SecureBuffer>::success(std::move(result));
+}
+
+
+Result<SecureBuffer> CryptoEngine::argon2id_derive(
+    const std::vector<uint8_t>& password,
+    const std::vector<uint8_t>& salt,
+    uint32_t ops_limit,
+    size_t mem_limit) const
+{
+    if (salt.size() != crypto_pwhash_SALTBYTES)
+        return Result<SecureBuffer>::failure("Argon2 salt must be 16 bytes");
+
+    // crypto_pwhash has no fixed output size (there's no such thing as
+    // crypto_pwhash_BYTES — the caller picks outlen); 32 bytes matches the
+    // AES-256 / ChaCha20 key size this is meant to derive.
+    constexpr size_t kDerivedKeyBytes = 32;
+    SecureBuffer output(kDerivedKeyBytes);
+
+    if (crypto_pwhash(
+            output.data(), output.size(),
+            reinterpret_cast<const char*>(password.data()), password.size(),
+            salt.data(),
+            ops_limit,
+            mem_limit,
+            crypto_pwhash_ALG_ARGON2ID13) != 0)
+        return Result<SecureBuffer>::failure("Argon2id derivation failed");
+
+    return Result<SecureBuffer>::success(std::move(output));
+}
+
+
+bool CryptoEngine::sodium_memcmp(
+    const std::vector<uint8_t>& a,
+    const std::vector<uint8_t>& b) noexcept
+{
+    if (a.size() != b.size()) return false;
+    // Qualified with :: — unqualified lookup here would find this very
+    // member function (same name, different scope) before ever considering
+    // libsodium's global ::sodium_memcmp, since C++ unqualified lookup stops
+    // at the first scope where the name is found.
+    return ::sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
+
+void CryptoEngine::sodium_memzero(void* ptr, size_t size) noexcept {
+    ::sodium_memzero(ptr, size);
+}
+
+#else
+
+// Libsodium not enabled — stub implementations that return errors
+Result<CryptoEngine::Ed25519KeyPair> CryptoEngine::generate_ed25519_keypair() const {
+    return Result<Ed25519KeyPair>::failure("Libsodium not enabled — build with -DEZONE_USE_LIBSODIUM=ON");
+}
+Result<std::vector<uint8_t>> CryptoEngine::sign_ed25519(
+    const std::vector<uint8_t>&, const SecureBuffer&) const {
+    return Result<std::vector<uint8_t>>::failure("Libsodium not enabled");
+}
+Result<bool> CryptoEngine::verify_ed25519(
+    const std::vector<uint8_t>&, const std::vector<uint8_t>&,
+    const std::vector<uint8_t>&) const {
+    return Result<bool>::failure("Libsodium not enabled");
+}
+Result<CryptoEngine::X25519KeyPair> CryptoEngine::generate_x25519_keypair() const {
+    return Result<X25519KeyPair>::failure("Libsodium not enabled");
+}
+Result<std::vector<uint8_t>> CryptoEngine::x25519_exchange(
+    const SecureBuffer&, const std::vector<uint8_t>&) const {
+    return Result<std::vector<uint8_t>>::failure("Libsodium not enabled");
+}
+Result<std::vector<uint8_t>> CryptoEngine::encrypt_chacha20poly1305(
+    const std::vector<uint8_t>&, const SecureBuffer&,
+    const std::vector<uint8_t>&) const {
+    return Result<std::vector<uint8_t>>::failure("Libsodium not enabled");
+}
+Result<SecureBuffer> CryptoEngine::decrypt_chacha20poly1305(
+    const std::vector<uint8_t>&, const SecureBuffer&,
+    const std::vector<uint8_t>&) const {
+    return Result<SecureBuffer>::failure("Libsodium not enabled");
+}
+Result<SecureBuffer> CryptoEngine::argon2id_derive(
+    const std::vector<uint8_t>&, const std::vector<uint8_t>&,
+    uint32_t, size_t) const {
+    return Result<SecureBuffer>::failure("Libsodium not enabled");
+}
+bool CryptoEngine::sodium_memcmp(
+    const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) noexcept {
+    // Fallback to constant_time_equal
+    return constant_time_equal(a, b);
+}
+void CryptoEngine::sodium_memzero(void* ptr, size_t size) noexcept {
+    // Fallback to OPENSSL_cleanse
+    OPENSSL_cleanse(ptr, size);
+}
+
+#endif // EZONE_LIBSODIUM_ENABLED
 
 } // namespace ezone

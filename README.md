@@ -19,12 +19,35 @@ ezone is an open-source authentication SDK built on P-384 ECDSA (NSA Suite B), A
 
 ## Features
 
-- **P-384 ECDSA** — NSA Suite B, FIPS 186-5 compliant
-- **AES-256-GCM** — authenticated symmetric encryption
-- **HMAC-SHA384** — stateless challenge and magic link verification
-- **Zero-storage challenges** — self-verifying via HMAC, no session DB needed
-- **WebAuthn / FIDO2** — hardware-backed passkeys (TouchID, FaceID, Windows Hello, YubiKey)
-- **FIPS 140-3 mode** — via OpenSSL 3.x FIPS provider
+### 8 Passwordless Auth Methods — Choose What You Need
+
+| Method | How It Works | Use Case |
+|---|---|---|
+| **Challenge-Response** | Device key signs HMAC challenge | Primary login (always on) |
+| **Magic Link** | HMAC-signed email link | Registration, password reset |
+| **Recovery Codes** | EZONE-XXXX-XXXX-XXXX codes | Lost device recovery |
+| **WebAuthn / FIDO2** | FaceID, TouchID, Windows Hello, YubiKey | Biometric login |
+| **QR Code** | AES-256-GCM encrypted, IP-bound | Desktop ↔ Phone login |
+| **Push Notification** | Server sends push, phone approves | Mobile app login |
+| **OTP (Email)** | 6-digit code via email | Fallback for non-tech users |
+| **OTP (SMS)** | 6-digit code via SMS | Optional SMS gateway integration |
+
+### Core Crypto
+
+| Algorithm | Library | Use Case |
+|-----------|---------|----------|
+| **P-384 ECDSA** | OpenSSL | FIPS-compliant signing (NSA Suite B) |
+| **Ed25519** | Libsodium | Fast signing (mobile, 2x faster than P-384) |
+| **AES-256-GCM** | OpenSSL | Server-side encryption (AES-NI hardware) |
+| **ChaCha20-Poly1305** | Libsodium | Mobile encryption (no AES-NI needed) |
+| **HMAC-SHA384** | OpenSSL | Challenge verification, magic links |
+| **Argon2id** | Libsodium | Memory-hard key derivation |
+| **X25519** | Libsodium | Key exchange |
+
+**Automatic selection:** The `CryptoStrategy` picks the best algorithm for your platform:
+- **Server with AES-NI:** P-384 + AES-256-GCM (FIPS-compliant)
+- **Mobile without AES-NI:** Ed25519 + ChaCha20-Poly1305 (faster)
+- **FIPS mode:** P-384 + AES-256-GCM only
 - **Multi-device** — independent keypairs per device, individual revocation
 - **Recovery codes** — single-use HMAC-hashed codes for lost-device recovery
 - **12 language SDKs** — Node.js, Python, Go, Browser, Rust, Java, Dart, Swift, .NET, PHP, Ruby, React Native
@@ -79,7 +102,22 @@ const session = await ezone.completeLogin({ email, challenge, signature, device_
 const user = await ezone.verifySession(req.headers.authorization.replace('Bearer ', ''));
 ```
 
-See the **[full example app](./examples/web/)** for a working React + Node.js integration.
+### Choose your auth methods
+
+```cpp
+ezone::AuthConfig cfg;
+
+// Enable only what your app needs:
+cfg.enabled_methods =
+    ezone::AuthMethod::Challenge |   // Device key login
+    ezone::AuthMethod::MagicLink |   // Email registration
+    ezone::AuthMethod::WebAuthn;     // Biometric login
+
+// Or enable everything:
+cfg.enabled_methods = ezone::AUTH_METHOD_ALL;
+```
+
+See the **[Developer Guide](./docs/DEVELOPER_GUIDE.md)** for complete auth flow diagrams.
 
 ---
 
@@ -109,13 +147,26 @@ See the **[full example app](./examples/web/)** for a working React + Node.js in
          │
   Language SDK client
          │  HTTP/HTTPS
-  ┌──────▼──────────────┐
-  │  ezone REST server  │   15 endpoints  /v1/auth/*
-  │  ─────────────────  │
-  │  Auth layer         │   registration · login · reset · recovery · devices
-  │  CryptoEngine       │   P-384 · AES-256-GCM · SHA-384 · HMAC-SHA384
-  │  StorageAdapter     │   pluggable persistence (MemoryAdapter built-in)
-  └─────────────────────┘
+  ┌──────▼──────────────────────────────────────────────┐
+  │  ezone REST server          30+ endpoints  /v1/*   │
+  │  ────────────────────────────────────────────────  │
+  │                                                    │
+  │  ┌─────────────┐  ┌──────────────┐  ┌───────────┐ │
+  │  │ Challenge   │  │ WebAuthn     │  │ QR Code   │ │
+  │  │ MagicLink   │  │ (FaceID,     │  │ (AES-256- │ │
+  │  │ Recovery    │  │  TouchID,    │  │  GCM +    │ │
+  │  │             │  │  YubiKey)    │  │  IP-bound)│ │
+  │  └─────────────┘  └──────────────┘  └───────────┘ │
+  │                                                    │
+  │  ┌─────────────┐  ┌──────────────┐                 │
+  │  │ Push        │  │ OTP          │                 │
+  │  │ Notification│  │ (Email/SMS)  │                 │
+  │  └─────────────┘  └──────────────┘                 │
+  │                                                    │
+  │  CryptoEngine       P-384 · AES-256-GCM · SHA-384  │
+  │  StorageAdapter     pluggable persistence           │
+  │  AuthConfig         developer chooses methods       │
+  └────────────────────────────────────────────────────┘
 ```
 
 The C++ core is also available as a shared library with a C API for direct embedding.
@@ -152,6 +203,23 @@ cmake --build build --config Release
 .\build\Release\ezone-server.exe
 ```
 
+### With Libsodium (recommended for mobile apps)
+
+```bash
+# Install Libsodium
+# macOS:  brew install libsodium
+# Ubuntu: sudo apt install libsodium-dev
+# Windows: vcpkg install libsodium
+
+# Build with Libsodium
+ cmake -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DEZONE_BUILD_SERVER=ON \
+  -DEZONE_USE_LIBSODIUM=ON
+
+# Server auto-selects: Ed25519 + ChaCha20 on mobile, P-384 + AES on server
+```
+
 ---
 
 ## Configuration
@@ -168,6 +236,9 @@ The server is configured via environment variables:
 | `EZONE_TLS_CERT` | — | TLS certificate (PEM) |
 | `EZONE_TLS_KEY` | — | TLS private key (PEM) |
 | `EZONE_REQUIRE_FIPS` | `false` | Require FIPS 140-3 mode |
+| `EZONE_CRYPTO_PROFILE` | `auto` | Crypto profile: `auto`, `fips`, `performance`, `balanced` |
+| `EZONE_PREFER_ED25519` | `false` | Force Ed25519 signing (requires Libsodium) |
+| `EZONE_PREFER_CHACHA20` | `false` | Force ChaCha20 encryption (requires Libsodium) |
 
 See the [full configuration reference](./docs/docs/self-hosting/configuration.md).
 
@@ -175,13 +246,28 @@ See the [full configuration reference](./docs/docs/self-hosting/configuration.md
 
 ## Security
 
+### Zero Passwords — Nothing to Leak
+
+| Attack | ezone Defense |
+|--------|---------------|
+| Database breach | No passwords stored — only public keys |
+| Phishing | WebAuthn binds to origin; QR is IP-bound |
+| Replay attacks | HMAC-signed challenges with timestamps |
+| Brute force | OTP: 3 attempts + 15 min lockout |
+| Stolen session | Stateless tokens, device key required |
+| QR screenshot | AES-256-GCM encrypted + 5 min expiry |
+| Clone detection | WebAuthn sign count enforcement |
+| Timing attacks | Constant-time comparison on all secrets |
+| User enumeration | `begin_reset` always returns success |
+
+### Implementation Security
+
 - All cryptographic operations use OpenSSL 3.x EVP APIs
 - Private keys are **never transmitted or stored server-side**
 - Challenges are single-use with nonce + HMAC — replay-proof
 - Magic links embed purpose byte — cross-purpose reuse is cryptographically impossible
-- `begin_reset` always returns success — prevents user enumeration
 - Recovery codes are HMAC-hashed, single-use, atomically consumed
-- Server enforces body size limits, rate limiting (60 req/min/IP), and input validation on all auth endpoints
+- Server enforces body size limits, rate limiting (60 req/min/IP), and input validation
 - Security headers on every response: HSTS, CSP, X-Frame-Options, etc.
 
 See the [Threat Model](./docs/docs/security/threat-model.md) and [Security Overview](./docs/docs/security/overview.md).

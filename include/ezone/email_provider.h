@@ -13,6 +13,12 @@ struct MagicLinkEmail {
     std::string purpose;      // "register" | "login" | "reset" | "add_device"
 };
 
+struct OTPEmail {
+    std::string to;           // recipient email address
+    std::string code;         // the OTP code to deliver
+    uint32_t    expiry_seconds = 300; // code lifetime
+};
+
 class EmailProvider {
 public:
     virtual ~EmailProvider() = default;
@@ -20,6 +26,15 @@ public:
     // Send a magic link email. Returns failure if the provider
     // rejects the request (network error, invalid API key, etc.).
     virtual Result<void> send(const MagicLinkEmail& mail) = 0;
+
+    // Send an OTP code email. Default implementation formats a simple text email.
+    // Override for custom OTP email templates.
+    virtual Result<void> send_otp(const OTPEmail& mail) {
+        // Default: just log to stderr (override in production)
+        fprintf(stderr, "[ezone] OTP code for %s: %s (expires in %u seconds)\n",
+                mail.to.c_str(), mail.code.c_str(), mail.expiry_seconds);
+        return Result<void>::success();
+    }
 };
 
 // ── Log provider (development / testing) ─────────────────────────────────────

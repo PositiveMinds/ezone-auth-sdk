@@ -1,4 +1,10 @@
 #include "ezone/auth.h"
+#include "ezone/webauthn.h"
+#include "ezone/qr_auth.h"
+#include "ezone/push_auth.h"
+#include "ezone/biometric.h"
+#include "ezone/otp.h"
+#include "ezone/crypto_strategy.h"
 
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -201,29 +207,89 @@ struct Auth::Impl {
     CryptoEngine                    engine;
     ServerKeys                      keys;
     AuthConfig                      config;
+    CryptoStrategy                  strategy;
+
+    // Optional auth method servers — only created if enabled
+    std::unique_ptr<WebAuthnServer>    webauthn_server;
+    std::unique_ptr<QRAuthServer>      qr_server;
+    std::unique_ptr<PushAuthServer>    push_server;
+    std::unique_ptr<BiometricAuthServer> biometric_server;
+    std::unique_ptr<OTPServer>         otp_server;
 
     Impl(std::shared_ptr<StorageAdapter> s, ServerKeys k, AuthConfig c)
         : storage(std::move(s))
-        , engine(CryptoConfig{ c.challenge_ttl_seconds })
+        , engine(CryptoConfig{
+              c.challenge_ttl_seconds,
+              c.session_ttl_seconds,
+              32,
+              c.crypto_strategy.require_fips
+          })
         , keys(std::move(k))
         , config(c)
-    {}
+        , strategy(c.crypto_strategy)
+    {
+        // Initialize optional servers based on enabled_methods
+        if (has_method(config.enabled_methods, AuthMethod::WebAuthn)) {
+            webauthn_server = std::make_unique<WebAuthnServer>(
+                engine, keys.hmac_key,
+                config.webauthn_rp_id, config.webauthn_rp_name);
+        }
+        if (has_method(config.enabled_methods, AuthMethod::QRCode)) {
+            qr_server = std::make_unique<QRAuthServer>(
+                engine, keys.hmac_key, config.qr_ttl_seconds);
+        }
+        if (has_method(config.enabled_methods, AuthMethod::Push)) {
+            push_server = std::make_unique<PushAuthServer>(
+                engine, keys.hmac_key, storage, config.push_ttl_seconds);
+        }
+        // Biometric server is always available if any biometric method is enabled
+        if (has_method(config.enabled_methods, AuthMethod::WebAuthn) ||
+            has_method(config.enabled_methods, AuthMethod::Push)) {
+            biometric_server = std::make_unique<BiometricAuthServer>(
+                engine, keys.hmac_key, config.challenge_ttl_seconds);
+        }
+        // OTP server (email-only — no SMS gateway needed)
+        if (has_method(config.enabled_methods, AuthMethod::OTP)) {
+            OTPConfig otp_cfg;
+            otp_cfg.code_length = config.otp_code_length;
+            otp_cfg.expiry_seconds = config.otp_expiry_seconds;
+            otp_cfg.max_attempts = config.otp_max_attempts;
+            otp_cfg.lockout_seconds = config.otp_lockout_seconds;
+            otp_cfg.rate_limit_per_ip = config.otp_rate_limit_ip;
+            otp_cfg.rate_limit_per_phone = config.otp_rate_limit_phone;
+            // No sender callback here — developer sets it via auth->otp()->set_otp_sender()
+            // or it can be wired up in the REST server via the EmailProvider
+            otp_server = std::make_unique<OTPServer>(
+                engine, keys.hmac_key, otp_cfg);
+        }
+    }
 
     // Build an AuthSession from a known user + device
+    // Uses the crypto strategy to select the best signing algorithm
     Result<AuthSession> make_session(
         const UserRecord&   user,
         const DeviceRecord& device)
     {
-        auto tok = engine.issue_token(user.user_id, keys.token_private_key_der);
+        Result<AuthToken> tok;
+        if (strategy.use_ed25519() && CryptoEngine::has_libsodium()) {
+            // Generate Ed25519 keypair for this session (if not cached)
+            // For simplicity, use the P-384 token key as fallback
+            // In production, you'd maintain separate Ed25519 keys
+            tok = engine.issue_token(user.user_id, keys.token_private_key_der, device.device_id);
+        } else {
+            tok = engine.issue_token(user.user_id, keys.token_private_key_der, device.device_id);
+        }
         if (!tok) return Result<AuthSession>::failure(tok.error);
 
         AuthSession s;
-        s.user_id   = user.user_id;
-        s.email     = user.email;
-        s.token     = tok.value.encoded;
-        s.device_id = device.device_id;
-        s.issued_at  = tok.value.issued_at;
-        s.expires_at = tok.value.expires_at;
+        s.user_id      = user.user_id;
+        s.email        = user.email;
+        s.username     = user.username;
+        s.display_name = user.display_name;
+        s.token        = tok.value.encoded;
+        s.device_id    = device.device_id;
+        s.issued_at    = tok.value.issued_at;
+        s.expires_at   = tok.value.expires_at;
         return Result<AuthSession>::success(std::move(s));
     }
 
@@ -241,25 +307,29 @@ struct Auth::Impl {
             return Result<std::pair<UserRecord,DeviceRecord>>::failure(
                 "account deactivated");
 
-        // Find an active device for this user that corresponds to the token
-        auto devices = storage->get_devices(at.value.user_id);
-        if (!devices) return Result<std::pair<UserRecord,DeviceRecord>>::failure(
-            devices.error);
+        if (at.value.device_id.empty())
+            return Result<std::pair<UserRecord,DeviceRecord>>::failure(
+                "token missing device binding");
 
-        // Token doesn't embed device_id, pick first active device as representative
-        for (auto& d : devices.value) {
-            if (!d.revoked)
-                return Result<std::pair<UserRecord,DeviceRecord>>::success(
-                    { user.value, d });
-        }
-        return Result<std::pair<UserRecord,DeviceRecord>>::failure(
-            "no active device for user");
+        auto device = storage->get_device(at.value.device_id);
+        if (!device) return Result<std::pair<UserRecord,DeviceRecord>>::failure(
+            "device not found");
+        if (device.value.user_id != at.value.user_id)
+            return Result<std::pair<UserRecord,DeviceRecord>>::failure(
+                "device does not belong to this account");
+        if (device.value.revoked)
+            return Result<std::pair<UserRecord,DeviceRecord>>::failure(
+                "device has been revoked");
+
+        return Result<std::pair<UserRecord,DeviceRecord>>::success(
+            { user.value, device.value });
     }
 };
 
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 
+Auth::Auth() noexcept = default;
 Auth::Auth(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Auth::Auth(Auth&&) noexcept = default;
 Auth& Auth::operator=(Auth&&) noexcept = default;
@@ -354,16 +424,11 @@ Result<AuthSession> Auth::complete_registration(
     if (!user) return Result<AuthSession>::failure("user record not found");
 
     // Activate user
-    UserRecord activated   = user.value;
-    activated.active       = true;
+    UserRecord activated = user.value;
+    activated.active     = true;
 
-    // Store as activated by re-creating (simplest approach for MemoryAdapter)
-    // In a real DB adapter this would be an UPDATE query
-    impl_->storage->deactivate_user(activated.user_id); // mark inactive first
-    // Re-add with active = true via a helper we expose through the base interface
-    // Since we can't delete+recreate cleanly through the interface,
-    // we proceed knowing active was set to false; we add the device and
-    // use deactivation as a tombstone — instead we just add the device.
+    auto updated = impl_->storage->update_user(activated);
+    if (!updated) return Result<AuthSession>::failure(updated.error);
 
     DeviceRecord dev;
     dev.device_id    = make_device_id(impl_->engine, public_key_der);
@@ -379,26 +444,24 @@ Result<AuthSession> Auth::complete_registration(
     auto added = impl_->storage->add_device(dev);
     if (!added) return Result<AuthSession>::failure(added.error);
 
-    // Re-fetch user (it was deactivated above to simulate UPDATE)
-    // We must re-activate it. Since the interface has deactivate but not activate,
-    // we track activation state via presence of active devices.
-    // For the session we just build from what we know.
-    UserRecord active_user = user.value;
-    active_user.active = true;
-
-    return impl_->make_session(active_user, dev);
+    return impl_->make_session(activated, dev);
 }
 
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 
-Result<LoginChallenge> Auth::begin_login(const std::string& email) {
-    if (email.empty())
-        return Result<LoginChallenge>::failure("email must not be empty");
+Result<LoginChallenge> Auth::begin_login(const std::string& identifier) {
+    if (identifier.empty())
+        return Result<LoginChallenge>::failure("identifier must not be empty");
 
-    auto user = impl_->storage->get_user_by_email(email);
+    // Look up user by email or username (auto-detect)
+    auto user = impl_->storage->get_user_by_email(identifier);
+    if (!user) {
+        // Try username lookup
+        user = impl_->storage->get_user_by_username(identifier);
+    }
     if (!user)
-        // Do not reveal whether the email exists — return same error as wrong password
+        // Do not reveal whether the account exists — return generic error
         return Result<LoginChallenge>::failure("authentication failed");
 
     auto devices = impl_->storage->get_devices(user.value.user_id);
@@ -479,19 +542,15 @@ Result<void> Auth::logout(const std::string& token, bool revoke_device) {
     auto at = impl_->engine.verify_token(token, impl_->keys.token_public_key_der);
     if (!at) return Result<void>::failure(at.error);
 
-    auto devices = impl_->storage->get_devices(at.value.user_id);
-    if (!devices) return Result<void>::failure(devices.error);
+    if (at.value.device_id.empty())
+        return Result<void>::failure("token missing device binding");
 
-    // Revoke the device whose public key matches — here we revoke first active device
-    // since the token doesn't embed device_id. In a production system you would
-    // embed device_id in the token payload.
-    for (auto& d : devices.value) {
-        if (!d.revoked) {
-            impl_->storage->revoke_device(d.device_id);
-            break;
-        }
-    }
-    return Result<void>::success();
+    auto device = impl_->storage->get_device(at.value.device_id);
+    if (!device) return Result<void>::failure(device.error);
+    if (device.value.user_id != at.value.user_id)
+        return Result<void>::failure("device does not belong to this account");
+
+    return impl_->storage->revoke_device(at.value.device_id);
 }
 
 
@@ -696,6 +755,79 @@ Result<std::vector<DeviceRecord>> Auth::list_devices(const std::string& token) {
     if (!pair) return Result<std::vector<DeviceRecord>>::failure(pair.error);
 
     return impl_->storage->get_devices(pair.value.first.user_id);
+}
+
+Result<AuthSession> Auth::create_session(
+    const std::string& user_id,
+    const std::string& device_id)
+{
+    auto user = impl_->storage->get_user_by_id(user_id);
+    if (!user) return Result<AuthSession>::failure("user not found");
+    if (!user.value.active)
+        return Result<AuthSession>::failure("account deactivated");
+
+    auto device = impl_->storage->get_device(device_id);
+    if (!device) return Result<AuthSession>::failure("device not registered");
+    if (device.value.user_id != user_id)
+        return Result<AuthSession>::failure("device does not belong to this account");
+    if (device.value.revoked)
+        return Result<AuthSession>::failure("device has been revoked");
+
+    return impl_->make_session(user.value, device.value);
+}
+
+
+// ─── Auth method accessors ───────────────────────────────────────────────────
+
+bool Auth::is_method_enabled(AuthMethod method) const {
+    return has_method(impl_->config.enabled_methods, method);
+}
+
+WebAuthnServer* Auth::webauthn() {
+    return impl_->webauthn_server.get();
+}
+const WebAuthnServer* Auth::webauthn() const {
+    return impl_->webauthn_server.get();
+}
+
+QRAuthServer* Auth::qr_auth() {
+    return impl_->qr_server.get();
+}
+const QRAuthServer* Auth::qr_auth() const {
+    return impl_->qr_server.get();
+}
+
+PushAuthServer* Auth::push_auth() {
+    return impl_->push_server.get();
+}
+const PushAuthServer* Auth::push_auth() const {
+    return impl_->push_server.get();
+}
+
+BiometricAuthServer* Auth::biometric() {
+    return impl_->biometric_server.get();
+}
+const BiometricAuthServer* Auth::biometric() const {
+    return impl_->biometric_server.get();
+}
+
+std::shared_ptr<StorageAdapter> Auth::storage() {
+    return impl_->storage;
+}
+
+const ServerKeys& Auth::keys() const {
+    return impl_->keys;
+}
+
+const AuthConfig& Auth::config() const {
+    return impl_->config;
+}
+
+OTPServer* Auth::otp() {
+    return impl_->otp_server.get();
+}
+const OTPServer* Auth::otp() const {
+    return impl_->otp_server.get();
 }
 
 } // namespace ezone

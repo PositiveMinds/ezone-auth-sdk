@@ -27,6 +27,14 @@ target_compile_definitions(ezone-server PRIVATE
     CPPHTTPLIB_OPENSSL_SUPPORT
 )
 
+# main.cpp reads server config from environment variables via getenv(), which
+# MSVC's CRT flags as "unsafe" (C4996) and recommends _dupenv_s for — not
+# applicable here (single-threaded startup, no buffer to overflow). Silence
+# it rather than switching to a Windows-only API for portable config code.
+if(MSVC)
+    target_compile_definitions(ezone-server PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 target_link_libraries(ezone-server PRIVATE
     ezone-sdk
     httplib::httplib

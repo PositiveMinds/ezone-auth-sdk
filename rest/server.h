@@ -32,6 +32,12 @@ struct ServerConfig {
     // Maximum request body size in bytes. Requests exceeding this are
     // rejected with 413 before any parsing occurs.
     size_t      max_body_bytes    = 65'536;
+
+    // Trust the X-Forwarded-For header for client IP (rate limiting, QR
+    // IP-binding). Only enable this when the server sits behind a reverse
+    // proxy that overwrites/strips client-supplied X-Forwarded-For — otherwise
+    // any client can spoof this header to bypass rate limits and IP binding.
+    bool        trust_proxy_headers = false;
 };
 
 class RestServer {

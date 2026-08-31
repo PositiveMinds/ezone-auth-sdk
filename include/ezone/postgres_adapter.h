@@ -41,7 +41,9 @@ public:
     Result<void>       create_user(const UserRecord& user)         override;
     Result<UserRecord> get_user_by_id(const std::string& user_id)  override;
     Result<UserRecord> get_user_by_email(const std::string& email) override;
+    Result<UserRecord> get_user_by_username(const std::string& username) override;
     Result<void>       deactivate_user(const std::string& user_id) override;
+    Result<void>       update_user(const UserRecord& user)         override;
 
     Result<void>                      add_device(const DeviceRecord& dev)         override;
     Result<std::vector<DeviceRecord>> get_devices(const std::string& user_id)     override;
@@ -53,6 +55,21 @@ public:
     Result<bool> consume_recovery_hash(
         const std::string& user_id, const std::string& code_hash) override;
     Result<void> clear_recovery_hashes(const std::string& user_id) override;
+
+    Result<void> add_webauthn_credential(const WebAuthnCredentialRecord& cred) override;
+    Result<std::vector<WebAuthnCredentialRecord>> get_webauthn_credentials(
+        const std::string& user_id) override;
+    Result<WebAuthnCredentialRecord> get_webauthn_credential(
+        const std::string& credential_id) override;
+    Result<void> update_webauthn_sign_count(
+        const std::string& credential_id, uint64_t new_count) override;
+    Result<void> remove_webauthn_credential(const std::string& credential_id) override;
+
+    Result<void> add_push_device(const PushDeviceRecord& dev) override;
+    Result<std::vector<PushDeviceRecord>> get_push_devices(
+        const std::string& user_id) override;
+    Result<PushDeviceRecord> get_push_device(const std::string& device_id) override;
+    Result<void> deactivate_push_device(const std::string& device_id) override;
 
 private:
     struct Impl;

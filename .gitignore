@@ -5,9 +5,11 @@
 build/
 cmake-build-*/
 *.o
+*.obj
 *.a
 *.so
 *.dylib
+*.log
 
 # IDE
 .vscode/
@@ -21,3 +23,9 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 _deps/
+
+# Node.js bindings (bindings/nodejs, bindings/browser) — package-lock.json
+# IS committed (npm ci in CI requires it); node_modules/ and build output are not.
+node_modules/
+bindings/*/dist/
+*.tgz

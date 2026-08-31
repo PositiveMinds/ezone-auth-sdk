@@ -22,6 +22,32 @@ endif()
 # Find OpenSSL (3.x required for modern EVP API)
 find_package(OpenSSL 3.0 REQUIRED)
 
+# Optional: Libsodium for Ed25519, X25519, ChaCha20-Poly1305, Argon2
+option(EZONE_USE_LIBSODIUM "Enable Libsodium for modern crypto primitives" OFF)
+if(EZONE_USE_LIBSODIUM)
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SODIUM libsodium)
+    endif()
+    if(NOT SODIUM_FOUND)
+        find_path(SODIUM_INCLUDE_DIR sodium.h)
+        # MSVC prebuilt packages ship "libsodium.lib", not "sodium.lib" —
+        # CMake's default Windows lib-prefix list doesn't try "lib" for you.
+        find_library(SODIUM_LIBRARY NAMES sodium libsodium)
+        if(SODIUM_INCLUDE_DIR AND SODIUM_LIBRARY)
+            set(SODIUM_INCLUDE_DIRS ${SODIUM_INCLUDE_DIR})
+            set(SODIUM_LIBRARIES ${SODIUM_LIBRARY})
+            set(SODIUM_FOUND TRUE)
+        endif()
+    endif()
+    if(NOT SODIUM_FOUND)
+        message(FATAL_ERROR "Libsodium not found. Install libsodium-dev or disable EZONE_USE_LIBSODIUM")
+    endif()
+    message(STATUS "Libsodium: enabled (Ed25519, X25519, ChaCha20-Poly1305, Argon2)")
+else()
+    message(STATUS "Libsodium: disabled (using OpenSSL only)")
+endif()
+
 # Optional: PostgreSQL support via libpq
 option(EZONE_POSTGRES "Build PostgreSQL storage adapter" OFF)
 if(EZONE_POSTGRES)
@@ -34,11 +60,21 @@ set(EZONE_SDK_SOURCES
     src/storage_adapter.cpp
     src/auth.cpp
     src/ezone_c.cpp
+    src/webauthn.cpp
+    src/qr_auth.cpp
+    src/push_auth.cpp
+    src/biometric.cpp
+    src/otp.cpp
+    src/crypto_strategy.cpp
     src/email/log_provider.cpp
-    src/email/resend_provider.cpp
 )
 if(EZONE_POSTGRES)
     list(APPEND EZONE_SDK_SOURCES src/postgres_adapter.cpp)
+endif()
+
+# Resend provider requires cpp-httplib (only available when server is built)
+if(EZONE_BUILD_SERVER)
+    list(APPEND EZONE_SDK_SOURCES src/email/resend_provider.cpp)
 endif()
 
 add_library(ezone-sdk STATIC ${EZONE_SDK_SOURCES})
@@ -51,6 +87,18 @@ target_include_directories(ezone-sdk
 target_link_libraries(ezone-sdk
     PUBLIC OpenSSL::SSL OpenSSL::Crypto
 )
+
+if(EZONE_USE_LIBSODIUM)
+    target_compile_definitions(ezone-sdk PUBLIC EZONE_LIBSODIUM_ENABLED)
+    target_include_directories(ezone-sdk PUBLIC ${SODIUM_INCLUDE_DIRS})
+    target_link_libraries(ezone-sdk PUBLIC ${SODIUM_LIBRARIES})
+    if(MSVC)
+        # MSVC prebuilt Libsodium is typically consumed as a static .lib —
+        # without SODIUM_STATIC, sodium.h declares its functions
+        # __declspec(dllimport), which mismatches a static archive.
+        target_compile_definitions(ezone-sdk PUBLIC SODIUM_STATIC)
+    endif()
+endif()
 
 if(EZONE_POSTGRES)
     target_compile_definitions(ezone-sdk PUBLIC EZONE_POSTGRES_ENABLED)
@@ -68,8 +116,16 @@ add_executable(test_auth tests/test_auth.cpp)
 target_link_libraries(test_auth PRIVATE ezone-sdk)
 add_test(NAME auth_flow_tests COMMAND test_auth)
 
+add_executable(test_new_auth tests/test_new_auth.cpp)
+target_link_libraries(test_new_auth PRIVATE ezone-sdk)
+add_test(NAME new_auth_tests COMMAND test_new_auth)
+
 # REST server (optional — requires network access to fetch cpp-httplib)
 option(EZONE_BUILD_SERVER "Build the ezone REST server" ON)
 if(EZONE_BUILD_SERVER)
     add_subdirectory(rest)
+    # src/email/resend_provider.cpp (compiled into ezone-sdk, see
+    # EZONE_SDK_SOURCES above) uses cpp-httplib's SSLClient. Link it here,
+    # after rest/ has fetched and defined the httplib::httplib target.
+    target_link_libraries(ezone-sdk PUBLIC httplib::httplib)
 endif()

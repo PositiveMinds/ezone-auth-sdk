@@ -1,7 +1,9 @@
 #include "ezone/resend_provider.h"
 
-// cpp-httplib with OpenSSL for HTTPS support
-#define CPPHTTPLIB_OPENSSL_SUPPORT
+// cpp-httplib with OpenSSL for HTTPS support — CPPHTTPLIB_OPENSSL_SUPPORT is
+// supplied via CMake (propagated from the httplib::httplib target), not
+// defined here, so it isn't declared twice when both the compile definition
+// and this source file try to set it.
 #include <httplib.h>
 
 #include <sstream>

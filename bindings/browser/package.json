@@ -11,14 +11,33 @@
       "types":  "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
-    "dev":   "tsc --watch"
+    "dev":   "tsc --watch",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "typescript": "^5.4.0"
   },
   "keywords": ["passwordless", "webauthn", "passkeys", "webcrypto", "ezone"],
   "license": "MIT",
-  "sideEffects": false
+  "sideEffects": false,
+  "author": "ezone contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ezone-sdk/ezone-sdk.git",
+    "directory": "bindings/browser"
+  },
+  "homepage": "https://github.com/ezone-sdk/ezone-sdk/tree/main/bindings/browser#readme",
+  "bugs": {
+    "url": "https://github.com/ezone-sdk/ezone-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

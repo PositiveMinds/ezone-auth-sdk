@@ -179,7 +179,9 @@ export class EzonePasskey {
 
     const credential = await navigator.credentials.create({
       publicKey: {
-        challenge,
+        // Cast: TS 5.7+ no longer structurally matches a plain Uint8Array
+        // to BufferSource (it now excludes SharedArrayBuffer-backed views).
+        challenge: challenge as BufferSource,
         rp:   { id: this.opts.rpId, name: this.opts.rpName },
         user: {
           id:          new TextEncoder().encode(userId),
@@ -226,12 +228,12 @@ export class EzonePasskey {
     const allowCreds: PublicKeyCredentialDescriptor[] | undefined =
       credentialIds?.map(id => ({
         type: 'public-key' as const,
-        id:   base64urlDecode(id).buffer,
+        id:   base64urlDecode(id).buffer as BufferSource,
       }));
 
     const assertion = await navigator.credentials.get({
       publicKey: {
-        challenge:          challengeBytes,
+        challenge:          challengeBytes as BufferSource,
         allowCredentials:   allowCreds,
         userVerification:   'required',
         timeout:            60_000,

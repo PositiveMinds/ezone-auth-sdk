@@ -131,10 +131,12 @@ struct PoolGuard {
 
 static const char* SCHEMA = R"sql(
 CREATE TABLE IF NOT EXISTS ez_users (
-    user_id    TEXT PRIMARY KEY,
-    email      TEXT NOT NULL UNIQUE,
-    created_at BIGINT NOT NULL DEFAULT 0,
-    active     BOOLEAN NOT NULL DEFAULT TRUE
+    user_id      TEXT PRIMARY KEY,
+    email        TEXT NOT NULL UNIQUE,
+    username     TEXT UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at   BIGINT NOT NULL DEFAULT 0,
+    active       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS ez_devices (
@@ -152,6 +154,31 @@ CREATE TABLE IF NOT EXISTS ez_recovery_hashes (
     code_hash TEXT NOT NULL,
     PRIMARY KEY (user_id, code_hash)
 );
+
+CREATE TABLE IF NOT EXISTS ez_webauthn_credentials (
+    credential_id  TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL REFERENCES ez_users(user_id) ON DELETE CASCADE,
+    public_key_hex TEXT NOT NULL,
+    sign_count     BIGINT NOT NULL DEFAULT 0,
+    created_at     BIGINT NOT NULL DEFAULT 0,
+    aaguid         TEXT NOT NULL DEFAULT '',
+    label          TEXT NOT NULL DEFAULT '',
+    backed_up      BOOLEAN NOT NULL DEFAULT FALSE,
+    uv_required    BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS ez_webauthn_credentials_user_idx ON ez_webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS ez_push_devices (
+    device_id      TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL REFERENCES ez_users(user_id) ON DELETE CASCADE,
+    platform       SMALLINT NOT NULL DEFAULT 0,
+    push_token     TEXT NOT NULL,
+    public_key_hex TEXT NOT NULL,
+    label          TEXT NOT NULL DEFAULT '',
+    created_at     BIGINT NOT NULL DEFAULT 0,
+    active         BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS ez_push_devices_user_idx ON ez_push_devices(user_id);
 )sql";
 
 static void apply_schema(Conn& conn) {
@@ -202,12 +229,20 @@ Result<void> PostgresStorageAdapter::create_user(const UserRecord& user) {
     try {
         PoolGuard g(impl_->pool);
         std::string ts = std::to_string(user.created_at);
+        // libpq has no way to bind SQL NULL through PQexecParams' text-mode
+        // params, so an empty username is stored as '' rather than NULL.
+        // The UNIQUE constraint on username still allows this since it only
+        // applies to non-null values in Postgres... but multiple '' values
+        // would collide. Use NULL via a conditional instead.
+        const char* username_param = user.username.empty() ? nullptr : user.username.c_str();
+        const char* active_param = user.active ? "true" : "false";
         std::vector<const char*> p = {
-            user.user_id.c_str(), user.email.c_str(), ts.c_str()
+            user.user_id.c_str(), user.email.c_str(), username_param,
+            user.display_name.c_str(), ts.c_str(), active_param
         };
         PGresult* res = g->exec(
-            "INSERT INTO ez_users (user_id, email, created_at)"
-            " VALUES ($1, $2, $3)"
+            "INSERT INTO ez_users (user_id, email, username, display_name, created_at, active)"
+            " VALUES ($1, $2, $3, $4, $5, $6)"
             " ON CONFLICT DO NOTHING",
             p);
         PQclear(res);
@@ -219,10 +254,13 @@ Result<void> PostgresStorageAdapter::create_user(const UserRecord& user) {
 
 static UserRecord row_to_user(PGresult* res, int row) {
     UserRecord u;
-    u.user_id    = PQgetvalue(res, row, 0);
-    u.email      = PQgetvalue(res, row, 1);
-    u.created_at = static_cast<uint64_t>(std::stoul(PQgetvalue(res, row, 2)));
-    u.active     = std::string(PQgetvalue(res, row, 3)) == "t";
+    u.user_id      = PQgetvalue(res, row, 0);
+    u.email        = PQgetvalue(res, row, 1);
+    if (!PQgetisnull(res, row, 2))
+        u.username = PQgetvalue(res, row, 2);
+    u.display_name = PQgetvalue(res, row, 3);
+    u.created_at   = static_cast<uint64_t>(std::stoul(PQgetvalue(res, row, 4)));
+    u.active       = std::string(PQgetvalue(res, row, 5)) == "t";
     return u;
 }
 
@@ -231,7 +269,7 @@ Result<UserRecord> PostgresStorageAdapter::get_user_by_id(const std::string& use
         PoolGuard g(impl_->pool);
         std::vector<const char*> p = { user_id.c_str() };
         PGresult* res = g->exec(
-            "SELECT user_id, email, created_at, active"
+            "SELECT user_id, email, username, display_name, created_at, active"
             " FROM ez_users WHERE user_id = $1", p);
         if (PQntuples(res) == 0) {
             PQclear(res);
@@ -250,8 +288,27 @@ Result<UserRecord> PostgresStorageAdapter::get_user_by_email(const std::string& 
         PoolGuard g(impl_->pool);
         std::vector<const char*> p = { email.c_str() };
         PGresult* res = g->exec(
-            "SELECT user_id, email, created_at, active"
+            "SELECT user_id, email, username, display_name, created_at, active"
             " FROM ez_users WHERE email = $1", p);
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            return Result<UserRecord>::failure("user not found");
+        }
+        UserRecord u = row_to_user(res, 0);
+        PQclear(res);
+        return Result<UserRecord>::success(std::move(u));
+    } catch (const std::exception& e) {
+        return Result<UserRecord>::failure(e.what());
+    }
+}
+
+Result<UserRecord> PostgresStorageAdapter::get_user_by_username(const std::string& username) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { username.c_str() };
+        PGresult* res = g->exec(
+            "SELECT user_id, email, username, display_name, created_at, active"
+            " FROM ez_users WHERE username = $1", p);
         if (PQntuples(res) == 0) {
             PQclear(res);
             return Result<UserRecord>::failure("user not found");
@@ -270,6 +327,25 @@ Result<void> PostgresStorageAdapter::deactivate_user(const std::string& user_id)
         std::vector<const char*> p = { user_id.c_str() };
         PGresult* res = g->exec(
             "UPDATE ez_users SET active = FALSE WHERE user_id = $1", p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+Result<void> PostgresStorageAdapter::update_user(const UserRecord& user) {
+    try {
+        PoolGuard g(impl_->pool);
+        const char* username_param = user.username.empty() ? nullptr : user.username.c_str();
+        std::vector<const char*> p = {
+            user.email.c_str(), username_param, user.display_name.c_str(),
+            user.active ? "true" : "false", user.user_id.c_str()
+        };
+        PGresult* res = g->exec(
+            "UPDATE ez_users SET email = $1, username = $2, display_name = $3,"
+            " active = $4 WHERE user_id = $5",
+            p);
         PQclear(res);
         return Result<void>::success();
     } catch (const std::exception& e) {
@@ -419,6 +495,221 @@ Result<void> PostgresStorageAdapter::clear_recovery_hashes(
         std::vector<const char*> p = { user_id.c_str() };
         PGresult* res = g->exec(
             "DELETE FROM ez_recovery_hashes WHERE user_id = $1", p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+// ── WebAuthn credentials ──────────────────────────────────────────────────────
+
+static WebAuthnCredentialRecord row_to_webauthn_credential(PGresult* res, int row) {
+    WebAuthnCredentialRecord c;
+    c.credential_id  = PQgetvalue(res, row, 0);
+    c.user_id        = PQgetvalue(res, row, 1);
+    c.public_key_der = from_hex(PQgetvalue(res, row, 2));
+    c.sign_count     = static_cast<uint64_t>(std::stoull(PQgetvalue(res, row, 3)));
+    c.created_at     = static_cast<uint64_t>(std::stoul(PQgetvalue(res, row, 4)));
+    c.aaguid         = PQgetvalue(res, row, 5);
+    c.label          = PQgetvalue(res, row, 6);
+    c.backed_up      = std::string(PQgetvalue(res, row, 7)) == "t";
+    c.uv_required    = std::string(PQgetvalue(res, row, 8)) == "t";
+    return c;
+}
+
+Result<void> PostgresStorageAdapter::add_webauthn_credential(
+    const WebAuthnCredentialRecord& cred)
+{
+    try {
+        PoolGuard g(impl_->pool);
+        std::string hex_key = to_hex(cred.public_key_der);
+        std::string sc = std::to_string(cred.sign_count);
+        std::string ts = std::to_string(cred.created_at);
+        std::vector<const char*> p = {
+            cred.credential_id.c_str(), cred.user_id.c_str(), hex_key.c_str(),
+            sc.c_str(), ts.c_str(), cred.aaguid.c_str(), cred.label.c_str(),
+            cred.backed_up ? "true" : "false", cred.uv_required ? "true" : "false"
+        };
+        PGresult* res = g->exec(
+            "INSERT INTO ez_webauthn_credentials"
+            " (credential_id, user_id, public_key_hex, sign_count, created_at,"
+            "  aaguid, label, backed_up, uv_required)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            " ON CONFLICT DO NOTHING",
+            p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+Result<std::vector<WebAuthnCredentialRecord>>
+PostgresStorageAdapter::get_webauthn_credentials(const std::string& user_id) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { user_id.c_str() };
+        PGresult* res = g->exec(
+            "SELECT credential_id, user_id, public_key_hex, sign_count, created_at,"
+            " aaguid, label, backed_up, uv_required"
+            " FROM ez_webauthn_credentials WHERE user_id = $1 ORDER BY created_at",
+            p);
+        std::vector<WebAuthnCredentialRecord> out;
+        int n = PQntuples(res);
+        out.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            out.push_back(row_to_webauthn_credential(res, i));
+        PQclear(res);
+        return Result<std::vector<WebAuthnCredentialRecord>>::success(std::move(out));
+    } catch (const std::exception& e) {
+        return Result<std::vector<WebAuthnCredentialRecord>>::failure(e.what());
+    }
+}
+
+Result<WebAuthnCredentialRecord>
+PostgresStorageAdapter::get_webauthn_credential(const std::string& credential_id) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { credential_id.c_str() };
+        PGresult* res = g->exec(
+            "SELECT credential_id, user_id, public_key_hex, sign_count, created_at,"
+            " aaguid, label, backed_up, uv_required"
+            " FROM ez_webauthn_credentials WHERE credential_id = $1",
+            p);
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            return Result<WebAuthnCredentialRecord>::failure("credential not found");
+        }
+        WebAuthnCredentialRecord c = row_to_webauthn_credential(res, 0);
+        PQclear(res);
+        return Result<WebAuthnCredentialRecord>::success(std::move(c));
+    } catch (const std::exception& e) {
+        return Result<WebAuthnCredentialRecord>::failure(e.what());
+    }
+}
+
+Result<void> PostgresStorageAdapter::update_webauthn_sign_count(
+    const std::string& credential_id, uint64_t new_count)
+{
+    try {
+        PoolGuard g(impl_->pool);
+        std::string sc = std::to_string(new_count);
+        std::vector<const char*> p = { sc.c_str(), credential_id.c_str() };
+        PGresult* res = g->exec(
+            "UPDATE ez_webauthn_credentials SET sign_count = $1 WHERE credential_id = $2",
+            p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+Result<void> PostgresStorageAdapter::remove_webauthn_credential(
+    const std::string& credential_id)
+{
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { credential_id.c_str() };
+        PGresult* res = g->exec(
+            "DELETE FROM ez_webauthn_credentials WHERE credential_id = $1", p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+// ── Push devices ──────────────────────────────────────────────────────────────
+
+static PushDeviceRecord row_to_push_device(PGresult* res, int row) {
+    PushDeviceRecord d;
+    d.device_id      = PQgetvalue(res, row, 0);
+    d.user_id        = PQgetvalue(res, row, 1);
+    d.platform       = static_cast<uint8_t>(std::stoi(PQgetvalue(res, row, 2)));
+    d.push_token     = PQgetvalue(res, row, 3);
+    d.public_key_der = from_hex(PQgetvalue(res, row, 4));
+    d.label          = PQgetvalue(res, row, 5);
+    d.created_at     = static_cast<uint64_t>(std::stoul(PQgetvalue(res, row, 6)));
+    d.active         = std::string(PQgetvalue(res, row, 7)) == "t";
+    return d;
+}
+
+Result<void> PostgresStorageAdapter::add_push_device(const PushDeviceRecord& dev) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::string hex_key = to_hex(dev.public_key_der);
+        std::string platform = std::to_string(static_cast<int>(dev.platform));
+        std::string ts = std::to_string(dev.created_at);
+        std::vector<const char*> p = {
+            dev.device_id.c_str(), dev.user_id.c_str(), platform.c_str(),
+            dev.push_token.c_str(), hex_key.c_str(), dev.label.c_str(), ts.c_str()
+        };
+        PGresult* res = g->exec(
+            "INSERT INTO ez_push_devices"
+            " (device_id, user_id, platform, push_token, public_key_hex, label, created_at)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            " ON CONFLICT DO NOTHING",
+            p);
+        PQclear(res);
+        return Result<void>::success();
+    } catch (const std::exception& e) {
+        return Result<void>::failure(e.what());
+    }
+}
+
+Result<std::vector<PushDeviceRecord>>
+PostgresStorageAdapter::get_push_devices(const std::string& user_id) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { user_id.c_str() };
+        PGresult* res = g->exec(
+            "SELECT device_id, user_id, platform, push_token, public_key_hex, label,"
+            " created_at, active"
+            " FROM ez_push_devices WHERE user_id = $1 AND active = TRUE"
+            " ORDER BY created_at",
+            p);
+        std::vector<PushDeviceRecord> out;
+        int n = PQntuples(res);
+        out.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            out.push_back(row_to_push_device(res, i));
+        PQclear(res);
+        return Result<std::vector<PushDeviceRecord>>::success(std::move(out));
+    } catch (const std::exception& e) {
+        return Result<std::vector<PushDeviceRecord>>::failure(e.what());
+    }
+}
+
+Result<PushDeviceRecord>
+PostgresStorageAdapter::get_push_device(const std::string& device_id) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { device_id.c_str() };
+        PGresult* res = g->exec(
+            "SELECT device_id, user_id, platform, push_token, public_key_hex, label,"
+            " created_at, active"
+            " FROM ez_push_devices WHERE device_id = $1",
+            p);
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            return Result<PushDeviceRecord>::failure("push device not found");
+        }
+        PushDeviceRecord d = row_to_push_device(res, 0);
+        PQclear(res);
+        return Result<PushDeviceRecord>::success(std::move(d));
+    } catch (const std::exception& e) {
+        return Result<PushDeviceRecord>::failure(e.what());
+    }
+}
+
+Result<void> PostgresStorageAdapter::deactivate_push_device(const std::string& device_id) {
+    try {
+        PoolGuard g(impl_->pool);
+        std::vector<const char*> p = { device_id.c_str() };
+        PGresult* res = g->exec(
+            "UPDATE ez_push_devices SET active = FALSE WHERE device_id = $1", p);
         PQclear(res);
         return Result<void>::success();
     } catch (const std::exception& e) {

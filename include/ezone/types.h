@@ -5,8 +5,11 @@
 #include <string>
 #include <vector>
 
-// Forward declare so types.h has no OpenSSL dependency
+// Forward declare so types.h has no crypto library dependency
 extern "C" void OPENSSL_cleanse(void*, size_t);
+#ifdef EZONE_LIBSODIUM_ENABLED
+extern "C" void sodium_memzero(void*, size_t);
+#endif
 
 namespace ezone {
 
@@ -51,8 +54,13 @@ public:
 
 private:
     void wipe() {
-        if (!data_.empty())
+        if (!data_.empty()) {
+#ifdef EZONE_LIBSODIUM_ENABLED
+            sodium_memzero(data_.data(), data_.size());
+#else
             OPENSSL_cleanse(data_.data(), data_.size());
+#endif
+        }
     }
 
     std::vector<uint8_t> data_;
@@ -117,6 +125,7 @@ struct Credential {
 
 struct AuthToken {
     std::string user_id;
+    std::string device_id; // which device this token was issued for (may be empty)
     uint64_t    issued_at;
     uint64_t    expires_at;
     std::string encoded;   // base64url(header).base64url(payload).base64url(sig)

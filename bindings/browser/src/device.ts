@@ -145,7 +145,7 @@ export class EzoneDevice {
     const sigBuf = await crypto.subtle.sign(
       SIGN_ALGORITHM,
       this.keypair.privateKey,
-      challengeBytes,
+      challengeBytes as BufferSource,
     );
     return bufToB64url(sigBuf);
   }
@@ -154,7 +154,10 @@ export class EzoneDevice {
    * Sign arbitrary bytes (advanced use — prefer signChallenge).
    */
   async sign(data: Uint8Array): Promise<Uint8Array> {
-    const buf = await crypto.subtle.sign(SIGN_ALGORITHM, this.keypair.privateKey, data);
+    // TS 5.7+ narrowed BufferSource to exclude SharedArrayBuffer-backed
+    // views; a plain Uint8Array parameter no longer structurally matches
+    // without an explicit cast, even though it's never actually shared here.
+    const buf = await crypto.subtle.sign(SIGN_ALGORITHM, this.keypair.privateKey, data as BufferSource);
     return new Uint8Array(buf);
   }
 
