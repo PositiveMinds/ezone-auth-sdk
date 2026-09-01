@@ -112,20 +112,25 @@ if(EZONE_POSTGRES)
     target_link_libraries(ezone-sdk PUBLIC PostgreSQL::PostgreSQL)
 endif()
 
-# Tests
-enable_testing()
+# Tests (off by default when tests/ isn't in the build context at all --
+# e.g. a Docker build, whose .dockerignore excludes tests/ from a production
+# image entirely; there is nothing to add_executable() in that case).
+option(EZONE_BUILD_TESTS "Build the test suite (requires tests/)" ON)
+if(EZONE_BUILD_TESTS)
+    enable_testing()
 
-add_executable(test_crypto tests/test_crypto_engine.cpp)
-target_link_libraries(test_crypto PRIVATE ezone-sdk)
-add_test(NAME crypto_engine_tests COMMAND test_crypto)
+    add_executable(test_crypto tests/test_crypto_engine.cpp)
+    target_link_libraries(test_crypto PRIVATE ezone-sdk)
+    add_test(NAME crypto_engine_tests COMMAND test_crypto)
 
-add_executable(test_auth tests/test_auth.cpp)
-target_link_libraries(test_auth PRIVATE ezone-sdk)
-add_test(NAME auth_flow_tests COMMAND test_auth)
+    add_executable(test_auth tests/test_auth.cpp)
+    target_link_libraries(test_auth PRIVATE ezone-sdk)
+    add_test(NAME auth_flow_tests COMMAND test_auth)
 
-add_executable(test_new_auth tests/test_new_auth.cpp)
-target_link_libraries(test_new_auth PRIVATE ezone-sdk)
-add_test(NAME new_auth_tests COMMAND test_new_auth)
+    add_executable(test_new_auth tests/test_new_auth.cpp)
+    target_link_libraries(test_new_auth PRIVATE ezone-sdk)
+    add_test(NAME new_auth_tests COMMAND test_new_auth)
+endif()
 
 # REST server (optional — requires network access to fetch cpp-httplib)
 option(EZONE_BUILD_SERVER "Build the ezone REST server" ON)

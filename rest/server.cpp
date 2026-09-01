@@ -294,6 +294,26 @@ static bool handle_error(httplib::Response& res, const std::string& msg,
     if (msg.find("expired")       != std::string::npos) { bad_req(res, msg, cors);  return true; }
     if (msg.find("failed")        != std::string::npos) { unauth(res, msg, cors);   return true; }
     if (msg.find("forbidden")     != std::string::npos) { forbidden(res, cors);     return true; }
+    // The messages below are ordinary rejections of caller-supplied data
+    // (malformed/missing/mismatched fields, truncated or oversized blobs,
+    // unsupported versions) coming from SDK-layer input validation -- e.g. a
+    // garbage bearer token ("bad signature encoding"/"malformed token") or a
+    // hand-crafted QR/WebAuthn blob. They're reachable by anyone sending bad
+    // input and must map to 400, not 500: "internal server error" should
+    // mean the server is broken, not that the caller sent something invalid.
+    if (msg.find("malformed")     != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("missing")       != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("mismatch")      != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("required")      != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("must not be empty") != std::string::npos) { bad_req(res, msg, cors); return true; }
+    if (msg.find("too short")     != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("unsupported")   != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("incomplete")    != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("wrong purpose") != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("truncated")     != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("not a map")     != std::string::npos) { bad_req(res, msg, cors);  return true; }
+    if (msg.find("bad signature encoding") != std::string::npos) { bad_req(res, msg, cors); return true; }
+    if (msg.find("bad payload encoding")   != std::string::npos) { bad_req(res, msg, cors); return true; }
     server_err(res, cors);
     return true;
 }

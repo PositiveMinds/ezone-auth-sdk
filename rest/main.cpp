@@ -4,10 +4,12 @@
 #include "ezone/email_provider.h"
 #include "ezone/resend_provider.h"
 #include "ezone/crypto_strategy.h"
+#include "ezone/push_auth.h"
 #ifdef EZONE_POSTGRES_ENABLED
 #include "ezone/postgres_adapter.h"
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <iostream>
@@ -265,6 +267,30 @@ int main() {
     } else {
         email_provider = std::make_shared<ezone::LogEmailProvider>();
         std::cout << "[ezone] Email provider: log (magic links printed to stdout)\n";
+    }
+
+    // ── Push notification sender ────────────────────────────────────────────
+    // Without a sender wired up, begin_push_auth() generates a challenge
+    // that goes nowhere -- there is no REST endpoint that hands the
+    // challenge to a client either, so push login is completely inert by
+    // default. This default log sender mirrors LogEmailProvider (dev/test
+    // only): it prints the request so a real client (or this project's own
+    // integration test) can retrieve it out of band. Wire a real gateway
+    // (APNs/FCM/web push) the same way in production.
+    if (auth_ptr->push_auth()) {
+        auth_ptr->push_auth()->set_push_sender(
+            [](const ezone::PushDevice& device, const std::string& request_id,
+               const std::string& challenge) -> ezone::Result<void> {
+                fprintf(stderr,
+                    "[ezone] Push notification for device %s (%s): "
+                    "request_id=%s challenge=%s\n",
+                    device.device_id.c_str(), device.label.c_str(),
+                    request_id.c_str(), challenge.c_str());
+                return ezone::Result<void>::success();
+            });
+        std::cout << "[ezone] Push sender: log (dev/test only -- wire a real "
+                     "gateway via Auth::push_auth()->set_push_sender before "
+                     "production)\n";
     }
 
     // ── SMS OTP (optional) ───────────────────────────────────────────────────

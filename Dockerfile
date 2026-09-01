@@ -17,6 +17,7 @@ RUN cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DEZONE_BUILD_SERVER=ON \
         -DEZONE_POSTGRES=ON \
+        -DEZONE_BUILD_TESTS=OFF \
     && cmake --build build --target ezone-server -j"$(nproc)"
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────

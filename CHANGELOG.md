@@ -235,9 +235,80 @@ attacker/unregistered-key/replay attempts are all rejected; every
   by anyone embedding the C++ SDK directly with their own gateway wired up;
   only the exposed-by-default REST surface was removed.
 
-### Known gaps (not yet fixed)
-- The rate limiter's actual reject-on-limit behavior (vs. the accept path) is
-  implemented and code-reviewed but not exercised by an automated test.
+### Fixed (Docker build, push delivery, verified by an end-to-end hands-on test pass)
+- **The Docker image never built.** `.dockerignore` excludes `tests/` from
+  the build context entirely, but top-level `CMakeLists.txt`
+  unconditionally `add_executable()`'d the three test binaries with no way
+  to opt out — `docker build` failed on a missing `tests/` directory every
+  time. Added `EZONE_BUILD_TESTS` (default `ON`; the `Dockerfile` passes
+  `OFF`). Verified: image builds clean, the container runs, and
+  `GET /v1/health` returns `{"status":"ok",...}` plus the expected
+  key-generation warning in `docker logs`.
+- **No push notification sender was wired up by default.** Without one,
+  `begin_push_auth()` generates a challenge that goes nowhere — there was
+  also no REST endpoint to hand it to a client out-of-band, so push login
+  was completely inert regardless of what the REST layer did. Added a
+  default log-based sender in `main.cpp` (mirrors the existing
+  `LogEmailProvider` pattern: dev/test only, prints to stderr so a real
+  client or an integration test can retrieve it out of band). Embedders
+  wire a real gateway (APNs/FCM/web push) via
+  `Auth::push_auth()->set_push_sender(...)` before production.
+- **The rate limiter's reject-on-limit path was verified end-to-end**
+  (previously listed below as an untested gap) by hand-instrumenting the
+  token bucket and firing genuine rapid-fire requests: it correctly
+  allows a burst up to the configured limit and 429s beyond it. The
+  original automated test that seemed to show 0 rejections in 75 rapid
+  requests was itself broken two different ways, not the limiter: (1) its
+  `httplib::Client` connected to the literal string `"localhost"`, which
+  on this dev box resolves the IPv6 candidate (`::1`) first with no
+  Happy-Eyeballs fallback, stalling ~2s per connection — inflating every
+  request's spacing enough that the token bucket's per-second refill kept
+  pace with consumption and it never actually emptied. Switched the test
+  client to `127.0.0.1` (fixed the whole suite's runtime from minutes to
+  ~3 seconds as a side effect). (2) the rate-limiter test ran *before* the
+  OTP/WebAuthn sections and shared the same per-IP bucket, so exhausting
+  it correctly 429'd those later, unrelated calls — moved the
+  rate-limiter burst to run last in the test.
+
+### Fixed (hands-on adversarial/penetration testing against a live server)
+Ran real attacks — not just a code review — against a running `ezone-server`
+instance: session-token tampering and forgery, SQL/NoSQL-injection-style
+payloads, oversized/malformed request bodies, malformed base64/CBOR blobs,
+X-Forwarded-For rate-limit-bypass attempts, and response-header/error-body
+inspection. One genuine, wide-reaching bug surfaced:
+- **A malformed or too-short cryptographic signature crashed into a 500
+  ("internal server error") instead of a clean 4xx rejection, across every
+  endpoint that verifies a P-384 signature** — session/bearer tokens, QR
+  approval, WebAuthn assertions, biometric login, and push approval all
+  share one `CryptoEngine::verify()` primitive. `EVP_DigestVerifyFinal`
+  returns a *negative* value (not just 0) when it can't even parse the
+  supplied bytes as a signature at all (e.g. a short garbage blob) — the
+  code treated that as an unexpected internal error rather than what it
+  actually is: an ordinary, attacker-reachable "this signature is invalid"
+  outcome, indistinguishable in practice from a well-formed signature that
+  simply doesn't match. Fixed in `crypto_engine.cpp` to treat both cases as
+  a clean `false` verification result. Confirmed exploitable via a bearer
+  token like `Bearer ZmFrZQ.ZmFrZQ.ZmFrZQ` before the fix; rejected 4xx
+  after.
+- **The REST layer's `handle_error()` fell back to 500 for any
+  `Result::failure()` message it didn't recognize** — and it recognized
+  only 7 substrings, so dozens of perfectly ordinary validation
+  rejections (`"malformed token"`, `"bad signature encoding"`,
+  `"malformed QR payload"`, `"missing attestation format"`, `"RP ID hash
+  mismatch"`, etc. — all directly reachable by sending bad input to the
+  REST API) were returning 500 instead of 400. A 500 should mean the
+  server is broken, not that the caller sent garbage; it's also a
+  monitoring/alerting hazard, since ordinary bad-input probing (or an
+  actual attack) would misreport as server errors. Expanded the
+  classifier to catch this whole class (malformed/missing/mismatched/
+  truncated/unsupported/incomplete input) rather than patching the one
+  reproduced case.
+- All 98 checks in the project's hands-on end-to-end test suite pass
+  against a live server, including the rate limiter's actual
+  reject-on-limit behavior and the adversarial pass above. Note: this is
+  the author's own hands-on testing, not an independent third-party
+  security audit — a compliance-grade pentest still requires an external
+  firm with legal standing for banking/military/regulated deployments.
 
 ### Security
 - Documented and hardened the actual current threat model — see

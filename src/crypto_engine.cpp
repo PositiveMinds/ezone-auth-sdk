@@ -309,8 +309,15 @@ Result<bool> CryptoEngine::verify(
     clear_openssl_errors();
 
     if (rc == 1)  return Result<bool>::success(true);
-    if (rc == 0)  return Result<bool>::success(false);  // invalid sig — not an error
-    return Result<bool>::failure("DigestVerifyFinal: internal error");
+    // EVP_DigestVerifyFinal returns 0 for "well-formed signature, doesn't
+    // match" and a negative value for "couldn't even parse this as a
+    // signature" (e.g. a too-short or non-DER blob) — both are ordinary,
+    // attacker-reachable outcomes for garbage/forged signature input across
+    // every caller of this function (session tokens, QR/WebAuthn/biometric/
+    // push signatures), not a genuine internal error. Collapsing both to a
+    // clean "invalid" result keeps malformed signatures a 4xx rejection
+    // instead of a 500.
+    return Result<bool>::success(false);
 }
 
 
