@@ -6,7 +6,56 @@ follows [Keep a Changelog](https://keepachangelog.com/), versioning follows
 
 ## [Unreleased]
 
+### Fixed (found by actually running the pushed CI, not just locally)
+Pushing the previous two commits' worth of work was the first time this
+branch's CI had actually run end-to-end. It failed on nearly every job —
+closing that gap surfaced real, previously-invisible bugs:
+- **`write_u32_be` (auth.cpp) was defined but never called** — GCC/Clang
+  both fail the build on this under `-Werror -Wunused-function`; MSVC's
+  `/W4` doesn't flag it the same way, so it was invisible locally. Removed
+  (genuinely dead code, not used anywhere).
+- **`sodium_init()`'s return value was silently discarded.** It's marked
+  `warn_unused_result` for a real reason — a `-1` return means libsodium's
+  RNG/implementation selection didn't complete, and every crypto primitive
+  called afterward would run without the guarantees libsodium is supposed to
+  provide. Now aborts at startup on failure instead of silently continuing
+  on broken crypto. Also only ever compiled on Linux (the new CI leg) since
+  it's the `EZONE_USE_LIBSODIUM=ON` path — GCC's `-Werror=unused-result`
+  caught what no prior build ever exercised.
+- **`docker-compose.yml`/`render.yaml` never surfaced the new
+  `EZONE_HMAC_KEY`/`EZONE_TOKEN_PRIVATE_KEY`/`EZONE_TOKEN_PUBLIC_KEY`/
+  `EZONE_ENABLED_METHODS`/`EZONE_WEBAUTHN_RP_ID` env vars** — both "one-click
+  deploy" paths this repo advertises would have silently kept the
+  fresh-keys-every-restart behavior the key-persistence fix was meant to
+  close. Added to both, along with a `getenv_nonempty()` helper in
+  `main.cpp`: these compose/Render templates pass optional vars through as
+  `"${VAR:-}"`, which sets the container's env var to an *empty string*
+  when the host doesn't provide one — plain `std::getenv() != nullptr`
+  treats that as "provided," which would have silently overwritten
+  defaults like `webauthn_rp_id`'s `"localhost"` with `""`.
+- **`bindings/go`'s `BearerMiddleware`/`SessionFromContext` never actually
+  worked.** Each declared its own function-local `type ctxKey struct{}` —
+  in Go, locally-scoped type declarations are distinct types even with an
+  identical name, so `ctx.Value(ctxKey{})` in `SessionFromContext` could
+  never match what `BearerMiddleware` stored under *its own* `ctxKey`
+  type. `ok` was always `false`. Fixed by hoisting a single shared
+  `sessionCtxKey` type. The Go test suite's mock server was also missing a
+  route for `DELETE /v1/auth/devices/{id}` entirely (only registered
+  `/v1/auth/devices` with no ID segment) — `TestMultiDevice` and
+  `TestBearerMiddleware` had never actually passed.
+- **`docs/` (the Docusaurus site) had no committed lockfile** (same class
+  of bug already fixed for `bindings/nodejs`/`bindings/browser` — `npm ci`
+  had nothing to install from) **and didn't build even once regenerated** —
+  Docusaurus 3.5.2's bundled `webpackbar` passes options to webpack's
+  `ProgressPlugin` that a newer resolved webpack (5.110.2, with no lockfile
+  previously pinning it) rejects as schema-invalid. Bumped to Docusaurus
+  3.10.2, which resolves a compatible webpack internally; build now
+  succeeds.
+
 ### Added
+- `getenv_nonempty()` in `rest/main.cpp` — every optional env var the server
+  reads now treats an empty string the same as unset, matching how
+  `docker-compose.yml`/`render.yaml` pass optional values through.
 - `EZONE_HMAC_KEY` / `EZONE_TOKEN_PRIVATE_KEY` / `EZONE_TOKEN_PUBLIC_KEY` —
   load a persisted, stable server key set instead of generating fresh random
   keys on every start. This was a hard production blocker: without it, every
@@ -144,25 +193,36 @@ real ECDSA signatures, a real CBOR/COSE-encoded WebAuthn attestation object
 built to the actual spec, and a real PostgreSQL 18.4 instance: QR, biometric,
 push, and WebAuthn logins all complete and issue real session tokens;
 attacker/unregistered-key/replay attempts are all rejected; every
-`PostgresStorageAdapter` method round-trips correctly. The one confirmed
-remaining gap: OTP's `verify` endpoint proves the code was correct but never
-calls `create_session` — unlike every other method above, it cannot
-currently complete a login by itself (see "Known gaps" below).
+`PostgresStorageAdapter` method round-trips correctly.
+
+- **OTP now completes a login, not just a verification.** `/auth/otp/verify`
+  previously returned `{status, channel, code_hash}` on success but never
+  issued a session — unlike every other method above. OTP has no
+  device-key concept to reuse `Auth::create_session(user_id, device_id)`
+  with directly, so this binds to a stable synthetic "OTP device" derived
+  from the user_id (via `CryptoEngine::derive_device_id`, repurposed as a
+  generic stable-ID hash rather than strictly a public-key hash), created
+  on first use. Only issued when the identifier matches an existing active
+  account with a known email — an unmatched identifier still gets a plain
+  `200` with no token field, so this can't be used to probe account
+  existence. Verified end-to-end: an existing account's OTP now returns a
+  working session token that resolves to the right account; a
+  non-existent account's OTP still verifies (no error) but issues no token.
+
+### Removed
+- **The `/auth/otp/sms` REST endpoint.** With no SMS gateway wired by
+  default (`OTPServer::set_sms_sender` is never called unless an embedder
+  does it themselves), it would still generate and hash a real code and
+  consume rate-limit budget, just never deliver it anywhere — and even when
+  "verified," it could never complete a login regardless, since
+  `StorageAdapter` has no phone-indexed user lookup for the session-issuance
+  fix above to use. `OTPServer::request_sms()` is unchanged and still usable
+  by anyone embedding the C++ SDK directly with their own gateway wired up;
+  only the exposed-by-default REST surface was removed.
 
 ### Known gaps (not yet fixed)
-- **OTP cannot complete a login.** `/auth/otp/verify` returns
-  `{status, channel, code_hash}` on success but never issues a session
-  token. Unlike WebAuthn/QR/push/biometric, OTP has no device-key concept,
-  so it can't reuse `Auth::create_session(user_id, device_id)` without a
-  design decision: either introduce a "deviceless" session (which
-  `resolve_session` currently rejects outright, by design, after this
-  session's device-binding fix) or auto-provision some form of identity for
-  OTP-verified users. Left for a deliberate follow-up rather than a rushed
-  fix.
 - The rate limiter's actual reject-on-limit behavior (vs. the accept path) is
   implemented and code-reviewed but not exercised by an automated test.
-- The updated CI workflow YAML was validated by running the equivalent
-  commands locally, not by an actual GitHub Actions run.
 
 ### Security
 - Documented and hardened the actual current threat model — see

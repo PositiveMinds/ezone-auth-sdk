@@ -34,9 +34,6 @@ uint64_t read_u64_be(const uint8_t* src) {
     for (int i = 0; i < 8; ++i) v = (v << 8) | src[i];
     return v;
 }
-void write_u32_be(uint8_t* dst, uint32_t v) {
-    dst[0]=(v>>24)&0xFF; dst[1]=(v>>16)&0xFF; dst[2]=(v>>8)&0xFF; dst[3]=v&0xFF;
-}
 
 // UUID v4 (random) — simple implementation without external deps
 std::string generate_uuid(CryptoEngine& eng) {

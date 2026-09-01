@@ -47,7 +47,7 @@ static std::string str(const std::string& k, const std::string& v) {
 static std::string num(const std::string& k, uint64_t v) {
     return "\"" + k + "\":" + std::to_string(v);
 }
-static std::string obj(std::initializer_list<std::string> fields) {
+static std::string obj(const std::vector<std::string>& fields) {
     std::string s = "{";
     bool first = true;
     for (auto& f : fields) {
@@ -1335,23 +1335,14 @@ struct RestServer::Impl {
         // ── OTP endpoints ─────────────────────────────────────────────────
         // Only registered if AuthMethod::OTP is enabled
         if (auth->is_method_enabled(AuthMethod::OTP) && auth->otp()) {
-            // Request OTP via SMS (requires SMS gateway callback)
-            svr.Post(pfx + "/auth/otp/sms",
-            [this, &co](const httplib::Request& req, httplib::Response& res) {
-                if (!guard(req, res)) return;
-                std::string phone = json::get_str(req.body, "phone");
-                if (phone.empty()) { bad_req(res, "phone required", co); return; }
-
-                std::string ip = this->client_ip(req);
-                auto r = auth->otp()->request_sms(phone, ip);
-                if (!r) { handle_error(res, r.error, co); return; }
-
-                ok(res, json::obj({
-                    json::str("token_id",  r.value.token_id),
-                    json::num("expires_at", r.value.expires_at),
-                    json::num("attempts_remaining", r.value.attempts_remaining)
-                }), co);
-            });
+            // No REST endpoint for SMS OTP: without an SMS gateway wired via
+            // OTPServer::set_sms_sender (nothing does this by default — see
+            // main.cpp), request_sms would still generate and hash a real
+            // code and consume rate-limit budget, just never deliver it
+            // anywhere. It also can't complete a login even when verified —
+            // StorageAdapter has no phone-indexed user lookup. Embedders of
+            // the C++ SDK directly can still call Auth::otp()->request_sms()
+            // themselves once they've wired a real gateway.
 
             // Request OTP — email-based (no SMS gateway needed)
             // Uses the EmailProvider configured on the server
@@ -1407,11 +1398,49 @@ struct RestServer::Impl {
                 auto r = auth->otp()->verify(token_id, code);
                 if (!r) { handle_error(res, r.error, co); return; }
 
-                ok(res, json::obj({
+                // OTP has no device-key concept — it proves control of an
+                // email/phone, not possession of a private key. To still
+                // issue a real session (like every other auth method here),
+                // bind it to a stable synthetic "OTP device" per user,
+                // derived from the user_id rather than a public key. Only
+                // done when the identifier matches an existing active
+                // account with email verification (SMS/phone identifiers
+                // have no equivalent lookup in StorageAdapter yet) — an
+                // unmatched identifier still gets a normal 200 with no
+                // token, so this can't be used to probe account existence.
+                std::string token;
+                uint64_t expires_at = 0;
+                if (r.value.channel == OTPChannel::Email) {
+                    auto user = auth->storage()->get_user_by_email(r.value.user_id);
+                    if (user && user.value.active) {
+                        auto device_id = CryptoEngine::derive_device_id(std::vector<uint8_t>(
+                            user.value.user_id.begin(), user.value.user_id.end()));
+                        if (device_id) {
+                            if (!auth->storage()->get_device(device_id.value)) {
+                                DeviceRecord dev_rec;
+                                dev_rec.device_id = device_id.value;
+                                dev_rec.user_id = user.value.user_id;
+                                dev_rec.label = "OTP (email)";
+                                dev_rec.created_at = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+                                auth->storage()->add_device(dev_rec);
+                            }
+                            auto sess = auth->create_session(user.value.user_id, device_id.value);
+                            if (sess) { token = sess.value.token; expires_at = sess.value.expires_at; }
+                        }
+                    }
+                }
+
+                std::vector<std::string> fields = {
                     json::str("status", otp_status_string(r.value.status)),
                     json::str("channel", otp_channel_string(r.value.channel)),
                     json::str("code_hash", r.value.code_hash)
-                }), co);
+                };
+                if (!token.empty()) {
+                    fields.push_back(json::str("token", token));
+                    fields.push_back(json::num("expires_at", expires_at));
+                }
+                ok(res, json::obj(fields), co);
             });
 
             // Check OTP lockout status

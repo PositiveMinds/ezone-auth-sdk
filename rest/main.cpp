@@ -15,6 +15,22 @@
 #include <sstream>
 #include <string>
 
+// ─── Env var helper ─────────────────────────────────────────────────────────
+//
+// Treats an env var set to the empty string the same as unset. This matters
+// because docker-compose.yml/render.yaml pass through optional vars as
+// `"${VAR:-}"`, which sets the container's env var to "" (not unset) when
+// the host doesn't provide a value — plain std::getenv() != nullptr would
+// otherwise treat that as "provided", e.g. silently overwriting
+// webauthn_rp_id's "localhost" default with "", or enabling a boolean flag
+// that was never actually meant to be turned on.
+static const char* getenv_nonempty(const char* name) {
+    char* (*raw_getenv)(const char*) = &std::getenv;
+    const char* v = raw_getenv(name);
+    return (v && *v) ? v : nullptr;
+}
+
+
 // ─── Signal handling ──────────────────────────────────────────────────────────
 
 static ezone::rest::RestServer* g_server = nullptr;
@@ -40,9 +56,9 @@ static void on_signal(int) {
 // manager for any real deployment. With none set, fresh keys are generated
 // for convenience (dev/test only) and printed once so they can be captured.
 static ezone::Result<ezone::ServerKeys> load_or_generate_server_keys() {
-    const char* hmac_env    = std::getenv("EZONE_HMAC_KEY");
-    const char* priv_env    = std::getenv("EZONE_TOKEN_PRIVATE_KEY");
-    const char* pub_env     = std::getenv("EZONE_TOKEN_PUBLIC_KEY");
+    const char* hmac_env    = getenv_nonempty("EZONE_HMAC_KEY");
+    const char* priv_env    = getenv_nonempty("EZONE_TOKEN_PRIVATE_KEY");
+    const char* pub_env     = getenv_nonempty("EZONE_TOKEN_PUBLIC_KEY");
     int provided = (hmac_env != nullptr) + (priv_env != nullptr) + (pub_env != nullptr);
 
     if (provided == 3) {
@@ -106,10 +122,10 @@ int main() {
     std::shared_ptr<ezone::StorageAdapter> storage;
 
 #ifdef EZONE_POSTGRES_ENABLED
-    if (const char* db_url = std::getenv("EZONE_DATABASE_URL")) {
+    if (const char* db_url = getenv_nonempty("EZONE_DATABASE_URL")) {
         ezone::PostgresConfig pg_cfg;
         pg_cfg.connection_string = db_url;
-        if (const char* v = std::getenv("EZONE_DB_POOL_SIZE"))
+        if (const char* v = getenv_nonempty("EZONE_DB_POOL_SIZE"))
             pg_cfg.pool_size = std::stoi(v);
 
         auto pg = ezone::PostgresStorageAdapter::create(pg_cfg);
@@ -130,16 +146,16 @@ int main() {
     // ── Auth instance ─────────────────────────────────────────────────────────
     ezone::AuthConfig auth_cfg;
     // Override defaults from environment if present
-    if (const char* v = std::getenv("EZONE_SESSION_TTL"))
+    if (const char* v = getenv_nonempty("EZONE_SESSION_TTL"))
         auth_cfg.session_ttl_seconds = static_cast<uint32_t>(std::stoul(v));
-    if (const char* v = std::getenv("EZONE_CHALLENGE_TTL"))
+    if (const char* v = getenv_nonempty("EZONE_CHALLENGE_TTL"))
         auth_cfg.challenge_ttl_seconds = static_cast<uint32_t>(std::stoul(v));
 
     // Which auth methods this server exposes. Without this, the REST server
     // is stuck on AUTH_METHOD_DEFAULT (Challenge + MagicLink + Recovery) —
     // WebAuthn/QR/Push/OTP/biometric would be compiled in but unreachable
     // via the shipped binary. Comma-separated list, or "all".
-    if (const char* v = std::getenv("EZONE_ENABLED_METHODS")) {
+    if (const char* v = getenv_nonempty("EZONE_ENABLED_METHODS")) {
         std::string list = v;
         if (list == "all") {
             auth_cfg.enabled_methods = ezone::AUTH_METHOD_ALL;
@@ -166,21 +182,21 @@ int main() {
     // the "localhost" default only works for local development. Without an
     // override, WebAuthn registration/authentication silently fails (origin
     // mismatch) on any real deployment.
-    if (const char* v = std::getenv("EZONE_WEBAUTHN_RP_ID"))
+    if (const char* v = getenv_nonempty("EZONE_WEBAUTHN_RP_ID"))
         auth_cfg.webauthn_rp_id = v;
-    if (const char* v = std::getenv("EZONE_WEBAUTHN_RP_NAME"))
+    if (const char* v = getenv_nonempty("EZONE_WEBAUTHN_RP_NAME"))
         auth_cfg.webauthn_rp_name = v;
 
     // Configure crypto strategy from environment
-    if (const char* v = std::getenv("EZONE_CRYPTO_PROFILE")) {
+    if (const char* v = getenv_nonempty("EZONE_CRYPTO_PROFILE")) {
         std::string profile = v;
         if (profile == "fips") auth_cfg.crypto_strategy.profile = ezone::CryptoProfile::FIPS;
         else if (profile == "performance") auth_cfg.crypto_strategy.profile = ezone::CryptoProfile::Performance;
         else if (profile == "balanced") auth_cfg.crypto_strategy.profile = ezone::CryptoProfile::Balanced;
     }
-    if (std::getenv("EZONE_PREFER_ED25519")) auth_cfg.crypto_strategy.prefer_ed25519 = true;
-    if (std::getenv("EZONE_PREFER_CHACHA20")) auth_cfg.crypto_strategy.prefer_chacha20 = true;
-    if (std::getenv("EZONE_REQUIRE_FIPS")) auth_cfg.crypto_strategy.require_fips = true;
+    if (getenv_nonempty("EZONE_PREFER_ED25519")) auth_cfg.crypto_strategy.prefer_ed25519 = true;
+    if (getenv_nonempty("EZONE_PREFER_CHACHA20")) auth_cfg.crypto_strategy.prefer_chacha20 = true;
+    if (getenv_nonempty("EZONE_REQUIRE_FIPS")) auth_cfg.crypto_strategy.require_fips = true;
 
     auto auth = ezone::Auth::create(storage, std::move(keys.value), auth_cfg);
     if (!auth) {
@@ -194,34 +210,34 @@ int main() {
     // ── REST server config ────────────────────────────────────────────────────
     ezone::rest::ServerConfig srv_cfg;
 
-    if (const char* v = std::getenv("EZONE_HOST"))    srv_cfg.host    = v;
-    if (const char* v = std::getenv("EZONE_PORT"))    srv_cfg.port    = std::stoi(v);
-    if (const char* v = std::getenv("EZONE_THREADS")) srv_cfg.threads = std::stoi(v);
-    if (const char* v = std::getenv("EZONE_APP_URL")) srv_cfg.app_url = v;
-    if (const char* v = std::getenv("EZONE_CORS_ORIGIN")) srv_cfg.cors_origin = v;
-    if (const char* v = std::getenv("EZONE_RATE_LIMIT"))
+    if (const char* v = getenv_nonempty("EZONE_HOST"))    srv_cfg.host    = v;
+    if (const char* v = getenv_nonempty("EZONE_PORT"))    srv_cfg.port    = std::stoi(v);
+    if (const char* v = getenv_nonempty("EZONE_THREADS")) srv_cfg.threads = std::stoi(v);
+    if (const char* v = getenv_nonempty("EZONE_APP_URL")) srv_cfg.app_url = v;
+    if (const char* v = getenv_nonempty("EZONE_CORS_ORIGIN")) srv_cfg.cors_origin = v;
+    if (const char* v = getenv_nonempty("EZONE_RATE_LIMIT"))
         srv_cfg.rate_limit_per_min = std::stoi(v);
-    if (const char* v = std::getenv("EZONE_TRUST_PROXY"))
+    if (const char* v = getenv_nonempty("EZONE_TRUST_PROXY"))
         srv_cfg.trust_proxy_headers = (std::string(v) == "1" || std::string(v) == "true");
 
     // ── TLS config ────────────────────────────────────────────────────────────
-    if (const char* v = std::getenv("EZONE_TLS_CERT")) {
+    if (const char* v = getenv_nonempty("EZONE_TLS_CERT")) {
         srv_cfg.cert_path = v;
         srv_cfg.use_tls   = true;
     }
-    if (const char* v = std::getenv("EZONE_TLS_KEY")) {
+    if (const char* v = getenv_nonempty("EZONE_TLS_KEY")) {
         srv_cfg.key_path = v;
     }
 
     // ── Email provider ────────────────────────────────────────────────────────
     std::shared_ptr<ezone::EmailProvider> email_provider;
 
-    const char* email_provider_env = std::getenv("EZONE_EMAIL_PROVIDER");
+    const char* email_provider_env = getenv_nonempty("EZONE_EMAIL_PROVIDER");
     std::string email_provider_name = email_provider_env ? email_provider_env : "log";
 
     if (email_provider_name == "resend") {
-        const char* api_key = std::getenv("EZONE_RESEND_API_KEY");
-        const char* from    = std::getenv("EZONE_EMAIL_FROM");
+        const char* api_key = getenv_nonempty("EZONE_RESEND_API_KEY");
+        const char* from    = getenv_nonempty("EZONE_EMAIL_FROM");
 
         if (!api_key || !from) {
             std::cerr << "[ezone] EZONE_EMAIL_PROVIDER=resend requires "
@@ -234,13 +250,13 @@ int main() {
         resend_cfg.from    = from;
 
         // Optional subject overrides
-        if (const char* v = std::getenv("EZONE_SUBJECT_REGISTER"))
+        if (const char* v = getenv_nonempty("EZONE_SUBJECT_REGISTER"))
             resend_cfg.register_subject = v;
-        if (const char* v = std::getenv("EZONE_SUBJECT_LOGIN"))
+        if (const char* v = getenv_nonempty("EZONE_SUBJECT_LOGIN"))
             resend_cfg.login_subject = v;
-        if (const char* v = std::getenv("EZONE_SUBJECT_RESET"))
+        if (const char* v = getenv_nonempty("EZONE_SUBJECT_RESET"))
             resend_cfg.reset_subject = v;
-        if (const char* v = std::getenv("EZONE_SUBJECT_ADD_DEVICE"))
+        if (const char* v = getenv_nonempty("EZONE_SUBJECT_ADD_DEVICE"))
             resend_cfg.add_device_subject = v;
 
         email_provider = std::make_shared<ezone::ResendEmailProvider>(

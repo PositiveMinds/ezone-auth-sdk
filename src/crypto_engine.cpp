@@ -12,6 +12,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -976,9 +977,19 @@ bool CryptoEngine::has_libsodium() noexcept {
 
 #ifdef EZONE_LIBSODIUM_ENABLED
 
-// Ensure Libsodium is initialized (called once)
+// Ensure Libsodium is initialized (called once).
+// sodium_init() returns 0 on success, 1 if already initialized, -1 on
+// failure. A -1 means the library's RNG/implementation selection didn't
+// complete, so every crypto primitive that follows would be running without
+// the safety guarantees libsodium is supposed to provide -- silently
+// continuing would risk producing insecure or simply incorrect output, so
+// abort at startup instead of limping along.
 struct SodiumInit {
-    SodiumInit() { sodium_init(); }
+    SodiumInit() {
+        if (sodium_init() < 0) {
+            std::abort();
+        }
+    }
 };
 static SodiumInit g_sodium_init;
 

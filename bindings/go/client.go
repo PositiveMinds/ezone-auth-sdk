@@ -280,13 +280,18 @@ func (c *Client) RevokeDevice(ctx context.Context, token, deviceID string) error
 
 // ─── Middleware helper ────────────────────────────────────────────────────────
 
+// sessionCtxKey is the context key BearerMiddleware stores the verified
+// session under. It must be the same type in both BearerMiddleware and
+// SessionFromContext -- a type declared locally inside each function (as
+// this used to be) is a distinct type per declaration even with an identical
+// name, so ctx.Value would never find what the middleware stored.
+type sessionCtxKey struct{}
+
 // BearerMiddleware returns an http.Handler that verifies the Authorization
 // header and injects session info into the request context.
 //
 //	mux.Handle("/api/", ezone.BearerMiddleware(client, mux))
 func BearerMiddleware(c *Client, next http.Handler) http.Handler {
-	type ctxKey struct{}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if len(auth) < 8 || auth[:7] != "Bearer " {
@@ -301,14 +306,13 @@ func BearerMiddleware(c *Client, next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), ctxKey{}, info)
+		ctx := context.WithValue(r.Context(), sessionCtxKey{}, info)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // SessionFromContext retrieves the SessionInfo injected by BearerMiddleware.
 func SessionFromContext(ctx context.Context) (*SessionInfo, bool) {
-	type ctxKey struct{}
-	v, ok := ctx.Value(ctxKey{}).(*SessionInfo)
+	v, ok := ctx.Value(sessionCtxKey{}).(*SessionInfo)
 	return v, ok
 }

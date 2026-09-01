@@ -121,17 +121,21 @@ func mockServer(t *testing.T) (*httptest.Server, *ezone.Client) {
 		})
 	})
 
-	mux.HandleFunc("/v1/auth/devices", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
+	mux.HandleFunc("/v1/auth/devices", func(w http.ResponseWriter, _ *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"devices": []map[string]any{
 				{"device_id": "dev-1", "label": "Laptop", "created_at": 1000, "revoked": false},
 				{"device_id": "dev-2", "label": "Phone",  "created_at": 2000, "revoked": false},
 			},
 		})
+	})
+
+	// The real server exposes DELETE /v1/auth/devices/:device_id (the ID is
+	// part of the path, not a query/body param) -- this was previously
+	// missing entirely, so RevokeDevice's request never matched any
+	// registered route and 404'd.
+	mux.HandleFunc("DELETE /v1/auth/devices/{device_id}", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	srv := httptest.NewServer(mux)
