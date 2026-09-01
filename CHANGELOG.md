@@ -51,6 +51,21 @@ closing that gap surfaced real, previously-invisible bugs:
   previously pinning it) rejects as schema-invalid. Bumped to Docusaurus
   3.10.2, which resolves a compatible webpack internally; build now
   succeeds.
+- **The macOS C++ job failed at the link step for every test binary**:
+  `ld: unknown options: -z -z`. `-Wl,-z,relro -Wl,-z,now` (RELRO/BIND_NOW
+  hardening) is GNU-ld/glibc-specific syntax Apple's `ld64` doesn't
+  understand, but it was being applied to every non-MSVC build, Linux and
+  macOS alike — same issue for the `-D_FORTIFY_SOURCE=2` compile macro.
+  Both now gated to Linux only.
+- **Every Python SDK CI job (3.9/3.11/3.12) failed to build a wheel**:
+  `bindings/python/pyproject.toml` declared
+  `build-backend = "setuptools.backends.legacy:build"`, which is not an
+  importable module in any current setuptools release. Corrected to the
+  real PEP 517 backend, `setuptools.build_meta`.
+
+With all of the above, this repository's full CI matrix (C++ on
+Linux/macOS/Windows, with and without Libsodium; Node.js; Browser; Python
+3.9/3.11/3.12; Go 1.22/1.23; Docs) passes end-to-end for the first time.
 
 ### Added
 - `getenv_nonempty()` in `rest/main.cpp` — every optional env var the server
