@@ -7,6 +7,19 @@ follows [Keep a Changelog](https://keepachangelog.com/), versioning follows
 ## [Unreleased]
 
 ### Added
+- `EZONE_HMAC_KEY` / `EZONE_TOKEN_PRIVATE_KEY` / `EZONE_TOKEN_PUBLIC_KEY` —
+  load a persisted, stable server key set instead of generating fresh random
+  keys on every start. This was a hard production blocker: without it, every
+  restart invalidated every session/magic link/recovery code, and running
+  more than one instance was broken outright (each generates independent
+  keys, so a token from instance A never verifies on instance B). With none
+  of the three set, the server still generates fresh keys for convenience
+  (dev/test only) but now prints them once so they can be captured; setting
+  only some of the three is rejected at startup rather than silently
+  falling back. Verified with a real two-instance test: a magic token
+  issued by one running instance was accepted by a separately-started
+  instance loading the same captured keys, and rejected by a third instance
+  started with different (freshly-generated) keys.
 - WebAuthn/FIDO2, QR-code cross-device login, push notification approval,
   OTP (email/SMS), and biometric-provider auth methods alongside the original
   challenge-response, magic-link, and recovery-code flows.

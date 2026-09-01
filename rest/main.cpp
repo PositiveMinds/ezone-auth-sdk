@@ -24,15 +24,80 @@ static void on_signal(int) {
 }
 
 
+// ─── Server keys ────────────────────────────────────────────────────────────
+//
+// Session tokens, magic links, and recovery-code hashes are all only valid
+// against the exact HMAC/signing keys that created them. Without a way to
+// load a stable, persisted set of keys:
+//   - restarting the server invalidates every active session and in-flight
+//     magic link
+//   - running more than one instance is broken outright — a token issued by
+//     instance A won't verify on instance B, since each generates its own
+//     random keys independently
+//
+// EZONE_HMAC_KEY / EZONE_TOKEN_PRIVATE_KEY / EZONE_TOKEN_PUBLIC_KEY (all
+// base64url, no padding) load a stable key set; set all three from a secrets
+// manager for any real deployment. With none set, fresh keys are generated
+// for convenience (dev/test only) and printed once so they can be captured.
+static ezone::Result<ezone::ServerKeys> load_or_generate_server_keys() {
+    const char* hmac_env    = std::getenv("EZONE_HMAC_KEY");
+    const char* priv_env    = std::getenv("EZONE_TOKEN_PRIVATE_KEY");
+    const char* pub_env     = std::getenv("EZONE_TOKEN_PUBLIC_KEY");
+    int provided = (hmac_env != nullptr) + (priv_env != nullptr) + (pub_env != nullptr);
+
+    if (provided == 3) {
+        auto hmac = ezone::CryptoEngine::base64url_decode(hmac_env);
+        auto priv = ezone::CryptoEngine::base64url_decode(priv_env);
+        auto pub  = ezone::CryptoEngine::base64url_decode(pub_env);
+        if (!hmac || !priv || !pub)
+            return ezone::Result<ezone::ServerKeys>::failure(
+                "EZONE_HMAC_KEY/EZONE_TOKEN_PRIVATE_KEY/EZONE_TOKEN_PUBLIC_KEY "
+                "must all be valid base64url");
+        if (hmac.value.size() != 32)
+            return ezone::Result<ezone::ServerKeys>::failure(
+                "EZONE_HMAC_KEY must decode to exactly 32 bytes");
+
+        ezone::ServerKeys keys;
+        keys.hmac_key = ezone::SecureBuffer(hmac.value.data(), hmac.value.size());
+        keys.token_private_key_der = ezone::SecureBuffer(priv.value.data(), priv.value.size());
+        keys.token_public_key_der  = std::move(pub.value);
+        return ezone::Result<ezone::ServerKeys>::success(std::move(keys));
+    }
+
+    if (provided > 0) {
+        return ezone::Result<ezone::ServerKeys>::failure(
+            "EZONE_HMAC_KEY, EZONE_TOKEN_PRIVATE_KEY, and EZONE_TOKEN_PUBLIC_KEY "
+            "must be set together, or not at all -- got only " +
+            std::to_string(provided) + " of 3");
+    }
+
+    // None set — generate fresh keys and print them so they CAN be captured,
+    // rather than silently discarding them on every restart.
+    auto keys = ezone::Auth::generate_server_keys();
+    if (!keys) return keys;
+
+    std::cerr <<
+        "[ezone] WARNING: no EZONE_HMAC_KEY/EZONE_TOKEN_PRIVATE_KEY/"
+        "EZONE_TOKEN_PUBLIC_KEY set -- generated FRESH keys for this run.\n"
+        "[ezone] Every session, magic link, and recovery code will be "
+        "invalidated on the next restart, and you cannot run more than one\n"
+        "[ezone] instance with these keys. For any real deployment, capture "
+        "the values below into your secrets manager and set all three env\n"
+        "[ezone] vars on every instance:\n"
+        "[ezone]   EZONE_HMAC_KEY=" << ezone::CryptoEngine::base64url_encode(keys.value.hmac_key.copy_out()) << "\n" <<
+        "[ezone]   EZONE_TOKEN_PRIVATE_KEY=" << ezone::CryptoEngine::base64url_encode(keys.value.token_private_key_der.copy_out()) << "\n" <<
+        "[ezone]   EZONE_TOKEN_PUBLIC_KEY=" << ezone::CryptoEngine::base64url_encode(keys.value.token_public_key_der) << "\n";
+
+    return keys;
+}
+
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 int main() {
-    // ── Server keys ───────────────────────────────────────────────────────────
-    // In production: load from environment variables / secrets manager.
-    // Here we generate fresh keys on each start (suitable for dev/testing).
-    auto keys = ezone::Auth::generate_server_keys();
+    auto keys = load_or_generate_server_keys();
     if (!keys) {
-        std::cerr << "[ezone] Failed to generate server keys: "
+        std::cerr << "[ezone] Failed to obtain server keys: "
                   << keys.error << "\n";
         return 1;
     }
