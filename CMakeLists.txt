@@ -13,10 +13,17 @@ else()
     add_compile_options(
         -Wall -Wextra -Wpedantic -Werror
         -fstack-protector-strong
-        -D_FORTIFY_SOURCE=2
         -fPIC
     )
-    add_link_options(-Wl,-z,relro -Wl,-z,now)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # -D_FORTIFY_SOURCE and -z relro/-z now are glibc/GNU-ld hardening
+        # flags with no Apple ld64 equivalent in this form -- ld64 rejects
+        # "-z" outright ("unknown options: -z -z"), so these must not be
+        # applied on macOS. -fstack-protector-strong and -fPIC above are
+        # fine on both.
+        add_compile_options(-D_FORTIFY_SOURCE=2)
+        add_link_options(-Wl,-z,relro -Wl,-z,now)
+    endif()
 endif()
 
 # Find OpenSSL (3.x required for modern EVP API)

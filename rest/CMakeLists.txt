@@ -46,6 +46,10 @@ target_link_libraries(ezone-server PRIVATE
 if(MSVC)
     target_compile_options(ezone-server PRIVATE /W4 /GS /sdl)
 else()
-    target_compile_options(ezone-server PRIVATE
-        -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2)
+    target_compile_options(ezone-server PRIVATE -Wall -Wextra -fstack-protector-strong)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # See the top-level CMakeLists.txt comment -- _FORTIFY_SOURCE is a
+        # glibc-specific hardening macro, not applicable on macOS.
+        target_compile_options(ezone-server PRIVATE -D_FORTIFY_SOURCE=2)
+    endif()
 endif()
