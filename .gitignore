@@ -31,3 +31,9 @@ node_modules/
 bindings/*/dist/
 *.tgz
 docs/.docusaurus/
+
+# Python bindings build output
+__pycache__/
+*.egg-info/
+bindings/python/build/
+bindings/python/dist/
