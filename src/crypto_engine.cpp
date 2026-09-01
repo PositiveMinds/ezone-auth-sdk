@@ -8,6 +8,9 @@
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/provider.h>
+#endif
 
 #include <array>
 #include <cassert>
@@ -134,10 +137,50 @@ CryptoEngine::CryptoEngine(const CryptoConfig& cfg)
     : impl_(std::make_unique<Impl>()) {
     impl_->cfg = cfg;
 
-    if (cfg.require_fips && !is_fips_mode()) {
+    if (cfg.require_fips) {
+#ifdef EZONE_LIBSODIUM_ENABLED
+        // Ed25519, X25519, ChaCha20-Poly1305, and Argon2id (the entire
+        // Libsodium code path) are not FIPS 140-2/3-approved algorithms,
+        // and Libsodium doesn't go through OpenSSL's provider system at
+        // all -- so it can't be blocked by restricting OpenSSL to the FIPS
+        // provider below. A binary built with EZONE_USE_LIBSODIUM=ON could
+        // still reach those algorithms via CryptoEngine's own API even
+        // while OpenSSL itself reports FIPS mode active, which would make
+        // require_fips a false compliance signal. Refuse outright rather
+        // than silently allowing that gap.
         throw std::runtime_error(
-            "ezone: FIPS mode required but OpenSSL is not in FIPS mode"
+            "ezone: FIPS mode was required (EZONE_REQUIRE_FIPS) but this "
+            "binary was built with EZONE_USE_LIBSODIUM=ON, whose Ed25519/"
+            "X25519/ChaCha20-Poly1305/Argon2id algorithms are not "
+            "FIPS-approved and bypass OpenSSL's provider system entirely. "
+            "Rebuild with EZONE_USE_LIBSODIUM=OFF for a FIPS-capable build."
         );
+#else
+        if (!is_fips_mode()) {
+            // Not already active via system-wide openssl.cnf -- attempt to
+            // load OpenSSL's own FIPS provider directly. This requires a
+            // NIST CMVP-validated FIPS provider module to actually be
+            // installed and configured on this system (e.g. built via
+            // `openssl fipsinstall`, or provided by the OS distribution) --
+            // ezone does not ship or validate that module itself; it only
+            // consumes it if present. "base" (non-cryptographic ASN.1/
+            // encoding helpers, no algorithm implementations) is loaded
+            // alongside it; "default" (which contains every non-approved
+            // algorithm too) is deliberately never loaded in this mode.
+            if (!OSSL_PROVIDER_load(nullptr, "fips") ||
+                !OSSL_PROVIDER_load(nullptr, "base") ||
+                !is_fips_mode()) {
+                throw std::runtime_error(
+                    "ezone: FIPS mode was required (EZONE_REQUIRE_FIPS) but "
+                    "no validated OpenSSL FIPS provider could be loaded on "
+                    "this system. Install and configure one first (e.g. "
+                    "`openssl fipsinstall`, or your OS distribution's "
+                    "FIPS-validated OpenSSL package) -- ezone cannot supply "
+                    "or validate this module itself."
+                );
+            }
+        }
+#endif
     }
 }
 

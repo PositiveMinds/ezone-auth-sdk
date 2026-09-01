@@ -30,6 +30,17 @@ services:
     expose:
       - "5432"
 
+  # ── Redis (optional) ─────────────────────────────────────────────────────────
+  # Only needed if you run more than one `ezone` replica and want the rate
+  # limit shared across them (set EZONE_REDIS_HOST=redis in your .env to
+  # opt in). Not started by default — `docker compose --profile redis up`.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ["redis"]
+    expose:
+      - "6379"
+
   # ── ezone REST server ────────────────────────────────────────────────────────
   ezone:
     build:
@@ -54,7 +65,10 @@ services:
       EZONE_TOKEN_PUBLIC_KEY:    "${EZONE_TOKEN_PUBLIC_KEY:-}"
 
       # Storage
-      EZONE_DATABASE_URL: "postgresql://${POSTGRES_USER:-ezone}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ezone}?sslmode=disable"
+      # connect_timeout=5: libpq has no default -- without one, a reconnect
+      # attempt during a Postgres outage can hang far longer than 5s before
+      # giving up (found by chaos-testing an outage against this pool).
+      EZONE_DATABASE_URL: "postgresql://${POSTGRES_USER:-ezone}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ezone}?sslmode=disable&connect_timeout=5"
       EZONE_DB_POOL_SIZE: "${EZONE_DB_POOL_SIZE:-8}"
 
       # Server
@@ -68,6 +82,13 @@ services:
       # client-supplied X-Forwarded-For — e.g. compose behind an nginx/Caddy
       # proxy on the same host. Never enable if ezone is directly reachable.
       EZONE_TRUST_PROXY: "${EZONE_TRUST_PROXY:-false}"
+      # Distributed rate limiting (optional) -- set EZONE_REDIS_HOST to share
+      # the rate limit across multiple replicas of this container via Redis
+      # instead of each one enforcing its own independent limit. Unset by
+      # default: a single compose replica needs no Redis.
+      EZONE_REDIS_HOST:     "${EZONE_REDIS_HOST:-}"
+      EZONE_REDIS_PORT:     "${EZONE_REDIS_PORT:-6379}"
+      EZONE_REDIS_PASSWORD: "${EZONE_REDIS_PASSWORD:-}"
 
       # Auth methods — "all", or a comma-separated list (see .env.example).
       # Defaults to challenge+magic_link+recovery only if unset.

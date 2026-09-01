@@ -172,11 +172,27 @@ jobs:
         run: go build ./... && go vet ./...
       # pkg.go.dev indexes new versions automatically when a tag is pushed
 
+  # ── Software Bill of Materials ───────────────────────────────────────────────
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ezone-sdk-${{ github.ref_name }}.spdx.json
+          upload-artifact: true
+          artifact-name: sbom-spdx
+
   # ── Create GitHub Release with all binaries ──────────────────────────────────
   github-release:
     name: GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build-native, publish-npm, publish-pypi]
+    needs: [build-native, publish-npm, publish-pypi, sbom]
     steps:
       - uses: actions/checkout@v4
 
@@ -188,6 +204,7 @@ jobs:
         run: |
           for dir in artifacts/*/; do
             name=$(basename "$dir")
+            [ "$name" = "sbom-spdx" ] && continue  # ship the raw SPDX file, not zipped
             zip -r "artifacts/${name}.zip" "$dir"
           done
 
@@ -216,6 +233,12 @@ jobs:
 
             ## Native binaries
             Download the pre-built server binary and shared library for your platform below.
-          files: artifacts/*.zip
+
+            ## Software Bill of Materials
+            `ezone-sdk-${{ github.ref_name }}.spdx.json` (SPDX 2.3, JSON) lists every dependency
+            across the C++, Node.js, browser, Python, and Go packages in this release.
+          files: |
+            artifacts/*.zip
+            artifacts/sbom-spdx/*.spdx.json
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

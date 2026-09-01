@@ -38,6 +38,23 @@ struct ServerConfig {
     // proxy that overwrites/strips client-supplied X-Forwarded-For — otherwise
     // any client can spoof this header to bypass rate limits and IP binding.
     bool        trust_proxy_headers = false;
+
+    // Distributed rate limiting: when redis_host is set, every replica of
+    // this server shares one counter per IP via Redis (a fixed 60-second
+    // window, not the in-memory limiter's precise token bucket) instead of
+    // each process enforcing its own independent per-instance limit —
+    // otherwise the effective limit multiplies by however many replicas are
+    // running. Empty (the default) keeps the existing single-process,
+    // in-memory limiter, so this is a no-op unless you opt in. Requires the
+    // binary to have been built with EZONE_USE_REDIS_RATELIMIT (default ON;
+    // see rest/CMakeLists.txt). A Redis outage fails OPEN (requests are
+    // allowed, not blocked) so a rate-limiting dependency can never take the
+    // whole API down — this trades strict enforcement for availability.
+    // No TLS support yet; only plain, optionally password-authenticated
+    // connections.
+    std::string redis_host;
+    int         redis_port     = 6379;
+    std::string redis_password;
 };
 
 class RestServer {

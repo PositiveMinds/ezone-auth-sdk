@@ -19,6 +19,9 @@ services:
         sync: false
       - key: EZONE_TOKEN_PUBLIC_KEY
         sync: false
+      # Include ?connect_timeout=5 (seconds) in the value -- libpq has no
+      # default, so a reconnect attempt during a Postgres outage can
+      # otherwise hang far longer before giving up.
       - key: EZONE_DATABASE_URL
         sync: false
       - key: EZONE_DB_POOL_SIZE
@@ -43,6 +46,17 @@ services:
       # X-Forwarded-For can be trusted for rate limiting / QR IP-binding.
       - key: EZONE_TRUST_PROXY
         value: "true"
+      # Distributed rate limiting (optional) -- set EZONE_REDIS_HOST if you
+      # add a Render Key Value (Redis-compatible) instance and scale this
+      # service to more than one instance, so the rate limit is shared
+      # instead of each instance enforcing its own independent limit. Leave
+      # unset for a single-instance deployment.
+      - key: EZONE_REDIS_HOST
+        sync: false
+      - key: EZONE_REDIS_PORT
+        value: "6379"
+      - key: EZONE_REDIS_PASSWORD
+        sync: false
       # Which auth methods to expose: "all", or a comma-separated list (see
       # .env.example). Defaults to challenge+magic_link+recovery if unset.
       - key: EZONE_ENABLED_METHODS

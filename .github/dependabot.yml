@@ -1,0 +1,46 @@
+version: 2
+updates:
+  # ── GitHub Actions ───────────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # ── Docker base image ────────────────────────────────────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ── Node.js SDK ──────────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/bindings/nodejs"
+    schedule:
+      interval: "weekly"
+
+  # ── Browser SDK ──────────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/bindings/browser"
+    schedule:
+      interval: "weekly"
+
+  # ── Docs site (Docusaurus) ───────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+
+  # ── Python SDK ───────────────────────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/bindings/python"
+    schedule:
+      interval: "weekly"
+
+  # ── Go SDK ───────────────────────────────────────────────────────────────────
+  - package-ecosystem: "gomod"
+    directory: "/bindings/go"
+    schedule:
+      interval: "weekly"

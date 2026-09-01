@@ -1,0 +1,66 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Catch newly-published CodeQL query/vuln patterns even with no code
+    # changes — Sunday 03:17 UTC (off-peak, deliberately not on the hour).
+    - cron: '17 3 * * 0'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-22.04
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: go
+            build-mode: autobuild
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      # C++ is a compiled language -- CodeQL needs to observe an actual
+      # build to trace through it. Reuses the same config the CI build
+      # exercises (server + both libsodium states aren't needed here; one
+      # representative build is enough for the security scan).
+      - name: Install C++ dependencies
+        if: matrix.language == 'c-cpp'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libpq-dev cmake ninja-build
+
+      - name: Build (C++)
+        if: matrix.language == 'c-cpp'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEZONE_BUILD_SERVER=ON \
+            -DEZONE_POSTGRES=ON
+          cmake --build build --config Release
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

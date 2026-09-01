@@ -6,6 +6,130 @@ follows [Keep a Changelog](https://keepachangelog.com/), versioning follows
 
 ## [Unreleased]
 
+### Fixed (load and chaos testing against a live server)
+Ran a genuinely concurrent load generator (8 threads, real P-384 keygen +
+real Postgres writes per request, not a mock) against a live server, then
+killed the Postgres container mid-run to see how it actually degrades —
+not just reviewed the code for what it's supposed to do.
+- **Baseline (healthy Postgres): 100% success, ~270 req/s sustained, zero
+  errors, p99 latency 86ms** across ~4,100 real register+device-provision
+  flows. No regressions from any of this session's other changes.
+- **Found a real concurrency bug in the Postgres connection pool**:
+  `Pool::acquire()` called `PQreset()` (a blocking network round-trip) on a
+  dropped connection *while still holding the pool's shared mutex* — every
+  other thread's `acquire()` call was blocked behind it, so instead of N
+  threads independently discovering Postgres is down and failing fast,
+  they serialized behind whichever one thread got there first. Moved the
+  reset outside the lock. Also documented (and wired into
+  `docker-compose.yml`) `connect_timeout` for `EZONE_DATABASE_URL` — libpq
+  has no default, so an unbound reconnect attempt can otherwise hang far
+  longer than intended during an outage.
+- **Verified the fix directly**: a single fresh request issued *during* an
+  active Postgres outage now returns a clean `500` in ~2ms — confirming
+  the server itself never hangs, it fails fast. (The multi-threaded load
+  tool still showed some connection-handling artifacts under a concurrent
+  failure burst after this fix; isolating the single-request case is what
+  showed those are specific to the test tool's own client-side connection
+  reuse on Windows, not a server-side hang — the numbers were
+  indistinguishable before/after the server-side fix, which a real
+  server-side improvement should have changed.)
+- **The critical safety property held throughout, both before and after
+  the fix**: the server process never crashed during the outage, returned
+  clean structured JSON errors (500/404, never an unhandled exception or a
+  connection reset) the entire time Postgres was down, and resumed serving
+  successful requests automatically within ~2s of Postgres coming back —
+  no restart needed.
+
+### Added (FIPS-capable crypto mode)
+- **`EZONE_REQUIRE_FIPS=true` now actually attempts to enable FIPS mode**,
+  not just check whether it's already on. Previously, `require_fips` only
+  ever *checked* `EVP_default_properties_is_fips_enabled()` and threw if it
+  was false — it never tried to activate FIPS mode itself, so it only ever
+  worked if an operator had already hand-configured OpenSSL's FIPS
+  provider system-wide via `openssl.cnf`, entirely outside this
+  application. Now `CryptoEngine`'s constructor attempts to load OpenSSL's
+  own "fips" provider (deliberately never "default", which contains every
+  non-approved algorithm too) directly, and only then checks. To be clear
+  about what this does and doesn't mean: **ezone consumes OpenSSL's own
+  NIST CMVP-validated FIPS provider if one is installed and configured on
+  the system — it does not ship, install, or independently validate that
+  module itself.** That remains the operator's responsibility (e.g. via
+  `openssl fipsinstall`, or an OS distribution's FIPS-validated OpenSSL
+  package).
+- **Refuses to start if `EZONE_REQUIRE_FIPS` is combined with a
+  `EZONE_USE_LIBSODIUM=ON` build**, with a clear error explaining why:
+  Ed25519, X25519, ChaCha20-Poly1305, and Argon2id aren't FIPS-approved,
+  and Libsodium doesn't go through OpenSSL's provider system at all, so
+  none of those algorithms could actually be blocked by restricting
+  OpenSSL to its FIPS provider — silently allowing this combination would
+  make `require_fips` a false compliance signal.
+- **Fixed a silent startup crash**: any exception thrown during startup
+  (the FIPS checks above being the immediate motivation, since testing
+  them turned up this exact failure) propagated straight out of `main()`
+  uncaught, so the process crashed via `std::terminate()` with **no error
+  message at all** reaching stderr — an operator would just see the
+  process disappear. `main()` now wraps startup in a try/catch and prints
+  `what()` before exiting 1.
+- **Fixed `EZONE_REQUIRE_FIPS`/`EZONE_PREFER_ED25519`/`EZONE_PREFER_CHACHA20`
+  checking mere *presence* rather than the value** (unlike
+  `EZONE_TRUST_PROXY`, which already correctly checks for `"1"`/`"true"`) —
+  `EZONE_REQUIRE_FIPS=false` would previously still *enable* strict FIPS
+  enforcement (any non-empty string counted as "set"), the opposite of
+  what setting it that way would suggest. All three now check the value.
+- Verified hands-on on this development machine (no FIPS provider
+  installed here): `EZONE_REQUIRE_FIPS=true` now fails fast at startup
+  with a clear, actionable message instead of silently continuing in
+  non-FIPS mode or crashing with no explanation; the default (unset) path
+  is unaffected, confirmed via the full 98-check E2E suite plus the
+  existing crypto unit tests, all still passing.
+
+### Added (production-hardening: distributed rate limiting, SBOM, CodeQL)
+- **Optional Redis-backed distributed rate limiting.** The existing limiter
+  is a per-process, in-memory token bucket — correct for a single instance,
+  but each replica behind a load balancer enforces its own independent
+  limit, so the effective ceiling multiplies by however many replicas are
+  running. Set `EZONE_REDIS_HOST` (+ optional `EZONE_REDIS_PORT` /
+  `EZONE_REDIS_PASSWORD`) to share one counter across every replica via
+  Redis instead — a fixed 60-second-window `INCR`/`EXPIRE` counter (simpler
+  than replicating the in-memory limiter's precise token bucket over the
+  network, at the cost of allowing up to ~2x burst right at a window
+  boundary — a standard, accepted tradeoff for this style of limiter).
+  Fails OPEN on any Redis error (connect/AUTH/command failure, with a
+  5-second backoff before retrying so a sustained outage doesn't add
+  latency to every single request) — a rate limiter must never become a
+  single point of failure for the whole API. Left unset (the default),
+  behavior is unchanged: the existing in-memory limiter, no Redis
+  required. Verified hands-on: two independent server processes sharing
+  one Redis instance together allow only the configured limit in total
+  (e.g. 20), not 20-per-process (40) — and a stopped Redis container
+  correctly fails open with bounded added latency, then resumes enforcing
+  the limit once it's back. A CI job reproduces this same two-replica
+  proof against a real `redis:7-alpine` service container on every push.
+  Uses `hiredis`, fetched via CMake `FetchContent` like the existing
+  `httplib` dependency (`EZONE_USE_REDIS_RATELIMIT`, default `ON`). No TLS
+  support yet for the Redis connection itself — plain or password-only.
+  Getting hiredis to actually build cleanly took two separate fixes, one
+  per toolchain: MSVC's `/WX` and GCC's `-Werror -Wpedantic` (inherited
+  from this project's own hardened compiler flags, since FetchContent
+  adds hiredis as a subdirectory of the current scope) both turned
+  hiredis's own vendored-C warnings into hard build failures — the
+  Windows one caught locally, the GCC one only by actually building the
+  Docker image (Linux/GCC has no MSVC-equivalent local dev loop here).
+  Fixed by clearing hiredis's own inherited `COMPILE_OPTIONS` in
+  `rest/CMakeLists.txt`, plus a toolchain-specific pragma around the one
+  `#include <hiredis.h>` in `server.cpp` (its own header still trips
+  `-Wpedantic`/C4200 for anything that merely includes it).
+- **Dependabot** (`.github/dependabot.yml`) covering every ecosystem this
+  repo ships: npm (Node.js SDK, browser SDK, docs), pip (Python SDK),
+  Go modules, GitHub Actions, and the Dockerfile's base image.
+- **CodeQL** (`.github/workflows/codeql.yml`) static analysis across C++,
+  JavaScript/TypeScript, Python, and Go, on every push/PR to `main` plus a
+  weekly scheduled scan (so newly-published vulnerability patterns get
+  checked even with no code changes).
+- **SBOM generation** (SPDX 2.3 JSON, via `anchore/sbom-action`) — as a CI
+  artifact on every push to `main`, and attached directly to every tagged
+  GitHub Release.
+
 ### Fixed (found by actually running the pushed CI, not just locally)
 Pushing the previous two commits' worth of work was the first time this
 branch's CI had actually run end-to-end. It failed on nearly every job —

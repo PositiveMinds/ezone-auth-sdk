@@ -180,3 +180,95 @@ jobs:
       - name: Build
         working-directory: docs
         run: npm run build
+
+  # ── Distributed rate limiter (Redis) ────────────────────────────────────────
+  # A real, running Redis, not a mock -- proves the shared-counter behavior
+  # (and its fail-open-on-outage path) actually works, the same way this was
+  # hand-verified in development: two independent server processes sharing
+  # one Redis-backed limit must together allow only the configured cap, not
+  # the cap per process.
+  rate-limiter-redis:
+    name: Rate limiter (Redis-backed)
+    runs-on: ubuntu-22.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake ninja-build
+
+      - name: Configure + Build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DEZONE_BUILD_SERVER=ON -DEZONE_BUILD_TESTS=OFF
+          cmake --build build
+
+      - name: Start two replicas sharing one Redis-backed limit
+        env:
+          EZONE_ENABLED_METHODS: all
+          EZONE_REDIS_HOST: localhost
+          EZONE_RATE_LIMIT: "20"
+        run: |
+          EZONE_PORT=8080 ./build/rest/ezone-server > replicaA.log 2>&1 &
+          EZONE_PORT=8081 ./build/rest/ezone-server > replicaB.log 2>&1 &
+          sleep 2
+
+      - name: Verify the limit is shared, not per-process
+        run: |
+          fire() {  # fire <port> <count> -- prints "allowed limited"
+            local port=$1 n=$2 allowed=0 limited=0
+            for i in $(seq 1 "$n"); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/v1/auth/qr/status?session_id=x")
+              if [ "$code" = "429" ]; then limited=$((limited+1)); else allowed=$((allowed+1)); fi
+            done
+            echo "$allowed $limited"
+          }
+          read okA limA <<< "$(fire 8080 15)"
+          echo "Replica A: allowed=$okA limited=$limA"
+          read okB limB <<< "$(fire 8081 15)"
+          echo "Replica B: allowed=$okB limited=$limB"
+          total=$((okA + okB))
+          echo "Total allowed across both replicas: $total (limit=20)"
+          # A per-process-only limiter would allow up to 15+15=30; a shared
+          # one cannot exceed the configured limit (20) no matter how the
+          # 30 requests are split across replicas.
+          if [ "$total" -gt 20 ]; then
+            echo "FAIL: rate limit was not actually shared across replicas ($total allowed, expected <= 20)"
+            cat replicaA.log replicaB.log
+            exit 1
+          fi
+          if [ "$limA" -eq 0 ] && [ "$limB" -eq 0 ]; then
+            echo "FAIL: no request was ever rate-limited -- the limiter isn't enforcing anything"
+            exit 1
+          fi
+          echo "PASS: shared limit enforced across two independent processes"
+
+  # ── SBOM ─────────────────────────────────────────────────────────────────────
+  # A dependency inventory for every ecosystem this repo ships (npm x3, pip,
+  # Go modules) so a newly-disclosed CVE can be checked against what's
+  # actually shipped without re-deriving it from five different lockfiles by
+  # hand. Runs on every push to main; the release workflow generates its own
+  # copy attached to each tagged release.
+  sbom:
+    name: SBOM
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ezone-sdk.spdx.json
+          upload-artifact: true
+          artifact-name: sbom-spdx

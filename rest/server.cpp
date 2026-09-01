@@ -11,6 +11,33 @@
 #include "ezone/biometric.h"
 #include "ezone/otp.h"
 
+#ifdef EZONE_REDIS_RATELIMIT_ENABLED
+// hiredis is fetched via CMake FetchContent (no install step), which
+// exposes hiredis.h at the fetched source root rather than nested under a
+// "hiredis/" prefix (that layout only appears after `make install`).
+// hiredis's own internal sds.h (transitively included) uses a zero-sized/
+// flexible array member (MSVC C4200; GCC/Clang -Wpedantic "ISO C++
+// forbids flexible array member") -- harmless and not our code to fix,
+// but this project builds itself with /WX or -Werror, which would
+// otherwise turn that warning fatal for anything that merely includes
+// this header (as it did on both toolchains when this was first wired
+// up: MSVC caught it locally, GCC caught the second one building the
+// Docker image).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4200)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+#include <hiredis.h>
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <functional>
@@ -122,7 +149,20 @@ static bool valid_field(const std::string& v) {
 
 // ─── Rate limiter ─────────────────────────────────────────────────────────────
 
-struct RateLimiter {
+// Common interface so RestServer::Impl can hold either backend uniformly —
+// see ServerConfig::redis_host for how the choice is made.
+struct IRateLimiter {
+    virtual ~IRateLimiter() = default;
+    // Returns true if the request is allowed, false if rate-limited.
+    virtual bool allow(const std::string& ip) = 0;
+};
+
+// Single-process token bucket. Precise (proportional refill, real burst
+// capacity up to the configured limit) but each server instance enforces
+// its own independent limit — running N replicas behind a load balancer
+// multiplies the effective ceiling by N. Use RedisRateLimiter below for a
+// limit that's actually shared across replicas.
+struct InMemoryRateLimiter : IRateLimiter {
     struct Bucket {
         int       tokens;
         std::chrono::steady_clock::time_point last_refill;
@@ -133,7 +173,7 @@ struct RateLimiter {
     int                                     limit_;   // max tokens (= per-minute cap)
     std::chrono::steady_clock::time_point   last_prune_{};
 
-    explicit RateLimiter(int per_minute) : limit_(per_minute) {}
+    explicit InMemoryRateLimiter(int per_minute) : limit_(per_minute) {}
 
     // Evict buckets idle long enough to be back at full capacity. Without
     // this, every distinct source IP (or spoofed X-Forwarded-For value, if
@@ -152,8 +192,7 @@ struct RateLimiter {
         }
     }
 
-    // Returns true if the request is allowed, false if rate-limited.
-    bool allow(const std::string& ip) {
+    bool allow(const std::string& ip) override {
         if (limit_ <= 0) return true;
         std::lock_guard<std::mutex> lk(mu_);
         auto now = std::chrono::steady_clock::now();
@@ -180,6 +219,102 @@ struct RateLimiter {
         return true;
     }
 };
+
+#ifdef EZONE_REDIS_RATELIMIT_ENABLED
+// Distributed fixed-window counter, shared over Redis by every replica of
+// this server. Simpler than replicating the in-memory limiter's token
+// bucket (which would need a Lua script for atomic refill-and-decrement
+// across the network) at the cost of allowing up to 2x the configured
+// burst right at a window boundary — an accepted, standard tradeoff for
+// this style of distributed limiter. Fails OPEN on any Redis error
+// (connect/AUTH/command failure): a rate limiter must never become a
+// single point of failure that takes down the whole API when its backing
+// store hiccups.
+struct RedisRateLimiter : IRateLimiter {
+    std::string   host_;
+    int           port_;
+    std::string   password_;
+    int           limit_;
+    std::mutex    mu_;
+    redisContext* ctx_ = nullptr;
+
+    RedisRateLimiter(std::string host, int port, std::string password, int limit)
+        : host_(std::move(host)), port_(port), password_(std::move(password)), limit_(limit) {}
+
+    ~RedisRateLimiter() override { if (ctx_) redisFree(ctx_); }
+
+    std::chrono::steady_clock::time_point next_retry_at_{};
+
+    // Reconnects (and re-authenticates) on demand — called with mu_ held.
+    bool ensure_connected() {
+        if (ctx_ && !ctx_->err) return true;
+        if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+
+        // During a sustained outage, don't pay a fresh connect timeout on
+        // every single request -- that would add up to `timeout` of
+        // latency to every guarded call for as long as Redis is down.
+        // Back off for a few seconds between reconnect attempts instead;
+        // requests in between still fail open immediately (no connect
+        // attempt at all), just without re-checking whether Redis has
+        // already recovered.
+        auto now = std::chrono::steady_clock::now();
+        if (now < next_retry_at_) return false;
+
+        // A short, fixed connect timeout: a hung/unreachable Redis must
+        // never stall request handling for longer than this.
+        struct timeval timeout { 1, 0 };
+        ctx_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
+        if (!ctx_ || ctx_->err) {
+            fprintf(stderr, "[ezone] Redis rate limiter: connect to %s:%d failed (%s) "
+                    "-- failing open (request allowed)\n", host_.c_str(), port_,
+                    ctx_ ? ctx_->errstr : "null context");
+            if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+            next_retry_at_ = now + std::chrono::seconds(5);
+            return false;
+        }
+        if (!password_.empty()) {
+            auto* r = static_cast<redisReply*>(
+                redisCommand(ctx_, "AUTH %s", password_.c_str()));
+            bool ok = r && r->type != REDIS_REPLY_ERROR;
+            if (r) freeReplyObject(r);
+            if (!ok) {
+                fprintf(stderr, "[ezone] Redis rate limiter: AUTH failed -- failing open\n");
+                redisFree(ctx_); ctx_ = nullptr;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool allow(const std::string& ip) override {
+        if (limit_ <= 0) return true;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!ensure_connected()) return true; // fail open
+
+        std::string key = "ezone:ratelimit:" + ip;
+        auto* r = static_cast<redisReply*>(redisCommand(ctx_, "INCR %s", key.c_str()));
+        if (!r || r->type == REDIS_REPLY_ERROR) {
+            if (r) freeReplyObject(r);
+            fprintf(stderr, "[ezone] Redis rate limiter: INCR failed -- failing open\n");
+            if (ctx_) { redisFree(ctx_); ctx_ = nullptr; }
+            next_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            return true;
+        }
+        long long count = r->integer;
+        freeReplyObject(r);
+
+        if (count == 1) {
+            // First hit of a new window -- start its 60s TTL. A crash
+            // between INCR and EXPIRE leaves a key with no expiry; treated
+            // as a rare, self-healing edge case rather than paying for a
+            // Lua script's extra round trip on every single request.
+            auto* er = static_cast<redisReply*>(redisCommand(ctx_, "EXPIRE %s 60", key.c_str()));
+            if (er) freeReplyObject(er);
+        }
+        return count <= limit_;
+    }
+};
+#endif
 
 
 // ─── Security headers ─────────────────────────────────────────────────────────
@@ -325,14 +460,23 @@ struct RestServer::Impl {
     std::shared_ptr<Auth>          auth;
     ServerConfig                   cfg;
     httplib::Server                svr;
-    RateLimiter                    limiter;
+    std::unique_ptr<IRateLimiter>  limiter;
     std::shared_ptr<EmailProvider> email;
 
     Impl(std::shared_ptr<Auth> a, const ServerConfig& c,
          std::shared_ptr<EmailProvider> e)
-        : auth(std::move(a)), cfg(c), limiter(c.rate_limit_per_min),
-          email(std::move(e))
+        : auth(std::move(a)), cfg(c), email(std::move(e))
     {
+#ifdef EZONE_REDIS_RATELIMIT_ENABLED
+        if (!cfg.redis_host.empty()) {
+            limiter = std::make_unique<RedisRateLimiter>(
+                cfg.redis_host, cfg.redis_port, cfg.redis_password, cfg.rate_limit_per_min);
+        } else
+#endif
+        {
+            limiter = std::make_unique<InMemoryRateLimiter>(cfg.rate_limit_per_min);
+        }
+
         // Wire up email provider as OTP sender if OTP is enabled
         if (auth->is_method_enabled(AuthMethod::OTP) && auth->otp() && email) {
             auto email_provider = email;
@@ -387,7 +531,7 @@ struct RestServer::Impl {
     bool guard(const httplib::Request& req, httplib::Response& res) {
         const auto& co = cfg.cors_origin;
         if (req.body.size() > cfg.max_body_bytes) { too_large(res, co); return false; }
-        if (!limiter.allow(client_ip(req)))        { rate_limited(res, co); return false; }
+        if (!limiter->allow(client_ip(req)))        { rate_limited(res, co); return false; }
         return true;
     }
 

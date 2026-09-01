@@ -112,7 +112,7 @@ static ezone::Result<ezone::ServerKeys> load_or_generate_server_keys() {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-int main() {
+static int run_server() {
     auto keys = load_or_generate_server_keys();
     if (!keys) {
         std::cerr << "[ezone] Failed to obtain server keys: "
@@ -196,9 +196,16 @@ int main() {
         else if (profile == "performance") auth_cfg.crypto_strategy.profile = ezone::CryptoProfile::Performance;
         else if (profile == "balanced") auth_cfg.crypto_strategy.profile = ezone::CryptoProfile::Balanced;
     }
-    if (getenv_nonempty("EZONE_PREFER_ED25519")) auth_cfg.crypto_strategy.prefer_ed25519 = true;
-    if (getenv_nonempty("EZONE_PREFER_CHACHA20")) auth_cfg.crypto_strategy.prefer_chacha20 = true;
-    if (getenv_nonempty("EZONE_REQUIRE_FIPS")) auth_cfg.crypto_strategy.require_fips = true;
+    // These check the value, not just presence -- getenv_nonempty() alone
+    // would make e.g. EZONE_REQUIRE_FIPS=false enable FIPS enforcement
+    // (any non-empty string is "present"), the opposite of what an
+    // operator setting it that way would intend.
+    if (const char* v = getenv_nonempty("EZONE_PREFER_ED25519"))
+        auth_cfg.crypto_strategy.prefer_ed25519 = (std::string(v) == "1" || std::string(v) == "true");
+    if (const char* v = getenv_nonempty("EZONE_PREFER_CHACHA20"))
+        auth_cfg.crypto_strategy.prefer_chacha20 = (std::string(v) == "1" || std::string(v) == "true");
+    if (const char* v = getenv_nonempty("EZONE_REQUIRE_FIPS"))
+        auth_cfg.crypto_strategy.require_fips = (std::string(v) == "1" || std::string(v) == "true");
 
     auto auth = ezone::Auth::create(storage, std::move(keys.value), auth_cfg);
     if (!auth) {
@@ -221,6 +228,14 @@ int main() {
         srv_cfg.rate_limit_per_min = std::stoi(v);
     if (const char* v = getenv_nonempty("EZONE_TRUST_PROXY"))
         srv_cfg.trust_proxy_headers = (std::string(v) == "1" || std::string(v) == "true");
+
+    // Distributed rate limiting -- set EZONE_REDIS_HOST to share the rate
+    // limit across every replica of this server via Redis instead of each
+    // process enforcing its own independent limit. See ServerConfig for the
+    // fail-open behavior and the fixed-window-vs-token-bucket tradeoff.
+    if (const char* v = getenv_nonempty("EZONE_REDIS_HOST")) srv_cfg.redis_host = v;
+    if (const char* v = getenv_nonempty("EZONE_REDIS_PORT")) srv_cfg.redis_port = std::stoi(v);
+    if (const char* v = getenv_nonempty("EZONE_REDIS_PASSWORD")) srv_cfg.redis_password = v;
 
     // ── TLS config ────────────────────────────────────────────────────────────
     if (const char* v = getenv_nonempty("EZONE_TLS_CERT")) {
@@ -319,6 +334,14 @@ int main() {
     ezone::CryptoStrategy strategy(auth_cfg.crypto_strategy);
     std::cout << "[ezone] " << strategy.describe() << "\n";
 
+    if (!srv_cfg.redis_host.empty()) {
+        std::cout << "[ezone] Rate limiter: Redis-backed (shared across replicas) at "
+                   << srv_cfg.redis_host << ":" << srv_cfg.redis_port << "\n";
+    } else {
+        std::cout << "[ezone] Rate limiter: in-memory (per-process only -- set "
+                     "EZONE_REDIS_HOST to share the limit across replicas)\n";
+    }
+
     std::cout << "[ezone] REST server listening on "
               << srv_cfg.host << ":" << srv_cfg.port << "\n";
 
@@ -326,4 +349,21 @@ int main() {
 
     std::cout << "[ezone] Server stopped.\n";
     return 0;
+}
+
+int main() {
+    // A handful of startup paths (CryptoEngine's FIPS-provider enforcement
+    // in particular) throw a std::runtime_error with a clear, actionable
+    // message on a genuine misconfiguration -- e.g. EZONE_REQUIRE_FIPS set
+    // on a system with no validated FIPS provider installed. Left
+    // uncaught, that message never reaches the operator at all: it
+    // propagates past this function entirely, and the process crashes via
+    // std::terminate() with no visible output (as observed testing this
+    // exact path) instead of a clean, explained exit.
+    try {
+        return run_server();
+    } catch (const std::exception& e) {
+        std::cerr << "[ezone] Fatal error during startup: " << e.what() << "\n";
+        return 1;
+    }
 }

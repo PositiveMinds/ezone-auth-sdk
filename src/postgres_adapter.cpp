@@ -98,11 +98,23 @@ struct Pool {
     }
 
     std::unique_ptr<Conn> acquire() {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [this]{ return !idle.empty(); });
-        auto c = std::move(idle.front());
-        idle.pop();
-        // Reset connection if it dropped
+        std::unique_ptr<Conn> c;
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [this]{ return !idle.empty(); });
+            c = std::move(idle.front());
+            idle.pop();
+        }
+        // Reset connection if it dropped -- done OUTSIDE the pool lock.
+        // PQreset() is a blocking network round-trip; during an outage
+        // (found by chaos-testing this against a killed Postgres
+        // container), doing this INSIDE the lock serialized every other
+        // thread's acquire() behind whichever one thread happened to grab
+        // a dead connection first -- turning N independent (if all
+        // failing) reconnect attempts into one at a time, so the whole
+        // pool stalled together for roughly N times as long as a single
+        // reconnect attempt takes, instead of each borrower failing fast
+        // and independently.
         if (PQstatus(c->pg) != CONNECTION_OK)
             PQreset(c->pg);
         return c;
