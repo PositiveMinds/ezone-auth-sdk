@@ -27,6 +27,15 @@ if(EZONE_USE_REDIS_RATELIMIT)
     set(DISABLE_TESTS ON CACHE BOOL "" FORCE)
     set(ENABLE_SSL     OFF CACHE BOOL "" FORCE)
     set(ENABLE_SSL_TESTS OFF CACHE BOOL "" FORCE)
+    # hiredis's own cmake_minimum_required() predates CMake's current
+    # policy floor. Newer CMake releases (seen on GitHub's macos-14
+    # runner; tolerated with only a deprecation warning by the CMake
+    # versions used locally and in the Linux/Docker build) hard-error on
+    # that instead of just warning: "Compatibility with CMake < 3.5 has
+    # been removed." This is CMake's own documented workaround -- treat a
+    # too-old cmake_minimum_required as satisfying 3.5 policy behavior
+    # instead of refusing to configure the subproject at all.
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
     FetchContent_MakeAvailable(hiredis)
 
     # hiredis is vendored C, not this project's code -- the top-level

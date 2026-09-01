@@ -118,7 +118,13 @@ not just reviewed the code for what it's supposed to do.
   Fixed by clearing hiredis's own inherited `COMPILE_OPTIONS` in
   `rest/CMakeLists.txt`, plus a toolchain-specific pragma around the one
   `#include <hiredis.h>` in `server.cpp` (its own header still trips
-  `-Wpedantic`/C4200 for anything that merely includes it).
+  `-Wpedantic`/C4200 for anything that merely includes it). A third
+  build failure surfaced only by actually pushing to CI: GitHub's
+  `macos-14` runner's CMake hard-errors on hiredis's outdated
+  `cmake_minimum_required()` ("Compatibility with CMake < 3.5 has been
+  removed") where the CMake versions used locally and in the Linux/Docker
+  build only warn. Fixed with CMake's own documented workaround,
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
 - **Dependabot** (`.github/dependabot.yml`) covering every ecosystem this
   repo ships: npm (Node.js SDK, browser SDK, docs), pip (Python SDK),
   Go modules, GitHub Actions, and the Dockerfile's base image.
