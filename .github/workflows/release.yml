@@ -28,7 +28,7 @@ jobs:
             lib_ext: .dll
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install OpenSSL (Linux)
         if: runner.os == 'Linux'
@@ -65,7 +65,7 @@ jobs:
           cp build/ezone-sdk* dist/ 2>/dev/null || true
           cp include/ezone/ezone_c.h dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/
@@ -76,8 +76,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: build-native
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -104,8 +104,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: build-native
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -137,8 +137,8 @@ jobs:
     permissions:
       id-token: write   # OIDC trusted publishing — no token needed
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -163,8 +163,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: build-native
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.22'
       - name: Verify module
@@ -177,7 +177,7 @@ jobs:
     name: SBOM
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
@@ -194,9 +194,9 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build-native, publish-npm, publish-pypi, sbom]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts/
 
@@ -216,7 +216,7 @@ jobs:
             --pretty=format:"- %s" >> $GITHUB_OUTPUT || true
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: ezone SDK ${{ github.ref_name }}
           body: |
