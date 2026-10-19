@@ -22,7 +22,7 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^7.0.2"
   },
   "keywords": ["passwordless", "webauthn", "passkeys", "webcrypto", "ezone"],
   "license": "MIT",
